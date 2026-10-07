@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.1.9';
+  const CONTENT_SCRIPT_VERSION = '0.1.13';
   if (window.__gptTgConnectorLoaded === CONTENT_SCRIPT_VERSION) return;
   window.__gptTgConnectorLoaded = CONTENT_SCRIPT_VERSION;
 
@@ -899,6 +899,24 @@
     if (message?.kind !== 'bridgeCommand') return;
 
     const command = message.command;
+
+    if (command?.type === 'cancel') {
+      const stop = first(SELECTORS.stop);
+
+      if (!stop) {
+        sendResponse({
+          ok: false,
+          error: 'ChatGPT is not currently generating.'
+        });
+        return;
+      }
+
+      stop.click();
+      setState('finishing', `cancel_requested ${domDiagnostics()}`);
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (command?.type !== 'sendPrompt') return;
 
     sendPrompt(command)
