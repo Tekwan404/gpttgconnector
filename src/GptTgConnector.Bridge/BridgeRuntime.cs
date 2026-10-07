@@ -18,12 +18,19 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
     private readonly SemaphoreSlim _socketSendGate = new(1, 1);
     private readonly SemaphoreSlim _stateChanged = new(0, int.MaxValue);
     private readonly object _chatHistoryLock = new();
+    private readonly object _messageRouteLock = new();
     private readonly List<RecentChat> _recentChats = LoadRecentChats();
+    private readonly List<TelegramMessageRoute> _messageRoutes = LoadMessageRoutes();
 
     private static readonly string ChatHistoryPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "GptTgConnector",
         "chats.json");
+
+    private static readonly string MessageRoutesPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "GptTgConnector",
+        "message-routes.json");
 
     private WebSocket? _socket;
     private int _queued;
@@ -50,6 +57,57 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         }
     }
 
+    public bool TryGetConversationForTelegramMessage(long messageId, out string url)
+    {
+        lock (_messageRouteLock)
+        {
+            var route = _messageRoutes.FirstOrDefault(item => item.MessageId == messageId);
+            url = route?.Url ?? string.Empty;
+            return route is not null;
+        }
+    }
+
+    public void RememberTelegramMessages(IEnumerable<long> messageIds, string? url)
+    {
+        if (!IsConversationUrl(url))
+            return;
+
+        var ids = messageIds.Distinct().Where(id => id > 0).ToArray();
+        if (ids.Length == 0)
+            return;
+
+        lock (_messageRouteLock)
+        {
+            foreach (var id in ids)
+            {
+                _messageRoutes.RemoveAll(item => item.MessageId == id);
+                _messageRoutes.Insert(0, new TelegramMessageRoute(
+                    id,
+                    url!,
+                    DateTimeOffset.UtcNow));
+            }
+
+            if (_messageRoutes.Count > 200)
+                _messageRoutes.RemoveRange(200, _messageRoutes.Count - 200);
+
+            SaveMessageRoutesUnsafe();
+        }
+    }
+
+    public async Task CancelAsync(CancellationToken ct)
+    {
+        if (!ExtensionConnected)
+            throw new InvalidOperationException("Edge extension is not connected.");
+
+        if (!HasActiveJob &&
+            LastState is not ("submitting" or "waiting" or "generating" or "tool_running" or "finishing"))
+        {
+            throw new InvalidOperationException("ChatGPT is not currently generating.");
+        }
+
+        await SendAsync(new BridgeCommand("cancel"), ct);
+    }
+
     public async Task NavigateAsync(string url, CancellationToken ct)
     {
         if (!ExtensionConnected || string.IsNullOrWhiteSpace(BoundUrl))
@@ -70,7 +128,22 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
             throw new InvalidOperationException("Only chatgpt.com navigation is allowed.");
         }
 
-        await SendAsync(new BridgeCommand("navigate", Url: target.ToString()), ct);
+        var previousState = LastState;
+        LastState = "navigating";
+        LastDetail = target.ToString();
+        SignalStateChange();
+
+        try
+        {
+            await SendAsync(new BridgeCommand("navigate", Url: target.ToString()), ct);
+        }
+        catch
+        {
+            LastState = previousState;
+            LastDetail = null;
+            SignalStateChange();
+            throw;
+        }
     }
 
     public void Attach(WebSocket socket)
@@ -330,6 +403,44 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         }
     }
 
+    private static List<TelegramMessageRoute> LoadMessageRoutes()
+    {
+        try
+        {
+            if (!File.Exists(MessageRoutesPath))
+                return [];
+
+            var json = File.ReadAllText(MessageRoutesPath);
+            return JsonSerializer.Deserialize<List<TelegramMessageRoute>>(json, Protocol.Json)?
+                .Where(route => route.MessageId > 0 && IsConversationUrl(route.Url))
+                .OrderByDescending(route => route.CreatedAt)
+                .Take(200)
+                .ToList() ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private void SaveMessageRoutesUnsafe()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(MessageRoutesPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+                Directory.CreateDirectory(directory);
+
+            File.WriteAllText(
+                MessageRoutesPath,
+                JsonSerializer.Serialize(_messageRoutes, Protocol.Json));
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not persist Telegram message routes");
+        }
+    }
+
     private void SignalStateChange()
     {
         try
@@ -373,3 +484,9 @@ public sealed record RecentChat(
     string Url,
     string Title,
     DateTimeOffset LastUsedAt);
+
+
+public sealed record TelegramMessageRoute(
+    long MessageId,
+    string Url,
+    DateTimeOffset CreatedAt);
