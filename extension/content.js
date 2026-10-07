@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.1.5';
+  const CONTENT_SCRIPT_VERSION = '0.1.6';
   if (window.__gptTgConnectorLoaded === CONTENT_SCRIPT_VERSION) return;
   window.__gptTgConnectorLoaded = CONTENT_SCRIPT_VERSION;
 
@@ -271,7 +271,7 @@
     const form = composer?.closest('form');
 
     return [
-      `composer=${composer ? composer.tagName.toLowerCase() : 'none'}`,
+      `composer=${composer ? composer.tagName.toLowerCase() : 'none'}`,\n      `composerClass=${composer ? String(composer.className || '').replace(/\\s+/g, '.').slice(0, 80) : 'none'}`,
       `editable=${Boolean(composer?.isContentEditable)}`,
       `composerText=${composerText().length}`,
       `form=${Boolean(form)}`,
@@ -570,6 +570,29 @@
     setState('idle', domDiagnostics());
   }
 
+  function selectComposerContents(composer) {
+    composer.focus();
+
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(composer);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }
+
+  function dispatchInput(composer, inputType, data = null) {
+    try {
+      composer.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: false,
+        inputType,
+        data
+      }));
+    } catch {
+      composer.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+
   function setComposerText(composer, text) {
     composer.focus();
 
@@ -582,31 +605,89 @@
       setter?.call(composer, text);
       composer.dispatchEvent(new Event('input', { bubbles: true }));
       composer.dispatchEvent(new Event('change', { bubbles: true }));
-      return;
+      return 'value-setter';
     }
 
     if (composer.isContentEditable) {
-      composer.replaceChildren();
-      composer.focus();
+      // ChatGPT uses a controlled rich-text editor. Mutating its DOM directly
+      // (replaceChildren/textContent) can leave React/ProseMirror state stale:
+      // text is visible, but the Send button never appears. Keep the editor
+      // alive and go through the browser editing command instead.
+      selectComposerContents(composer);
+
+      let inserted = false;
+
+      try {
+        inserted = Boolean(document.execCommand?.('insertText', false, text));
+      } catch {
+        inserted = false;
+      }
+
+      if (inserted) {
+        composer.dispatchEvent(new Event('change', { bubbles: true }));
+        return 'execCommand';
+      }
+
+      // Fallback for builds where execCommand is unavailable: update the
+      // current Range, then emit beforeinput/input so the controlled editor
+      // gets an editing event instead of only a raw DOM mutation.
+      selectComposerContents(composer);
+
+      try {
+        composer.dispatchEvent(new InputEvent('beforeinput', {
+          bubbles: true,
+          cancelable: true,
+          inputType: 'insertText',
+          data: text
+        }));
+      } catch {
+      }
 
       const selection = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(composer);
-      selection?.removeAllRanges();
-      selection?.addRange(range);
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
 
-      const inserted = document.execCommand?.('insertText', false, text);
-      if (!inserted) composer.textContent = text;
+      if (!range) {
+        throw new Error('Could not create a selection inside the ChatGPT composer.');
+      }
 
-      composer.dispatchEvent(new InputEvent('input', {
-        bubbles: true,
-        inputType: 'insertText',
-        data: text
-      }));
-      return;
+      range.deleteContents();
+      const textNode = document.createTextNode(text);
+      range.insertNode(textNode);
+      range.setStartAfter(textNode);
+      range.collapse(true);
+
+      selection.removeAllRanges();
+      selection.addRange(range);
+
+      dispatchInput(composer, 'insertText', text);
+      composer.dispatchEvent(new Event('change', { bubbles: true }));
+      return 'range-input';
     }
 
     throw new Error('Unsupported ChatGPT composer element.');
+  }
+
+  async function waitForComposerReadyForSend(composer, expectedText, timeoutMs = 3000) {
+    const expected = normalizeText(expectedText);
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const valueMatches = composerText() === expected;
+      const send = sendButtonElement(composer);
+      const sendReady = Boolean(
+        send &&
+        !send.disabled &&
+        send.getAttribute('aria-disabled') !== 'true'
+      );
+
+      if (valueMatches && sendReady) {
+        return true;
+      }
+
+      await delay(60);
+    }
+
+    return false;
   }
 
   function waitForEnabledSendButton(composer, timeoutMs = 2500) {
@@ -738,12 +819,24 @@
     generationBaseline = snapshotBlocks();
 
     setState('submitting', domDiagnostics());
-    setComposerText(composer, activePromptText);
+    const inputMethod = setComposerText(composer, activePromptText);
 
     const composerReady = await waitForComposerValue(activePromptText);
     if (!composerReady) {
       throw new Error(
-        `ChatGPT composer did not retain the prompt. ${domDiagnostics()}`
+        `ChatGPT composer did not retain the prompt. input=${inputMethod} ${domDiagnostics()}`
+      );
+    }
+
+    const sendReady = await waitForComposerReadyForSend(
+      composer,
+      activePromptText,
+      3000
+    );
+
+    if (!sendReady) {
+      throw new Error(
+        `ChatGPT editor did not enable Send after input. input=${inputMethod} ${domDiagnostics()}`
       );
     }
 
