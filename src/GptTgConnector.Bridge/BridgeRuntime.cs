@@ -13,6 +13,7 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         SingleReader = true,
         SingleWriter = false
     });
+
     private readonly ConcurrentDictionary<string, TaskCompletionSource<EdgeEnvelope>> _pending = new();
     private readonly SemaphoreSlim _socketSendGate = new(1, 1);
     private readonly SemaphoreSlim _stateChanged = new(0, int.MaxValue);
@@ -31,6 +32,7 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
     {
         var old = Interlocked.Exchange(ref _socket, socket);
         try { old?.Abort(); } catch { }
+
         LastState = "connected";
         logger.LogInformation("Edge extension connected");
         SignalStateChange();
@@ -38,13 +40,12 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
 
     public void Detach(WebSocket socket)
     {
-        if (ReferenceEquals(_socket, socket))
-        {
-            _socket = null;
-            LastState = "disconnected";
-            logger.LogWarning("Edge extension disconnected");
-            SignalStateChange();
-        }
+        if (!ReferenceEquals(_socket, socket)) return;
+
+        _socket = null;
+        LastState = "disconnected";
+        logger.LogWarning("Edge extension disconnected");
+        SignalStateChange();
     }
 
     public ValueTask QueueAsync(BridgeJob job, CancellationToken ct)
@@ -61,7 +62,9 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         await WaitUntilReadyAsync(ct);
 
         var completion = new TaskCompletionSource<EdgeEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_pending.TryAdd(job.Id, completion)) throw new InvalidOperationException("Duplicate job id.");
+        if (!_pending.TryAdd(job.Id, completion))
+            throw new InvalidOperationException("Duplicate job id.");
+
         _activeJobId = job.Id;
 
         try
@@ -77,7 +80,10 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         }
     }
 
-    public async Task HandleEdgeMessageAsync(EdgeEnvelope message, Func<EdgeEnvelope, Task> unsolicited, CancellationToken ct)
+    public async Task HandleEdgeMessageAsync(
+        EdgeEnvelope message,
+        Func<EdgeEnvelope, Task> unsolicited,
+        CancellationToken ct)
     {
         switch (message.Type)
         {
@@ -104,17 +110,39 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
                 break;
 
             case "result":
-            case "error":
-                LastState = message.Type == "error" ? "error" : "idle";
-                if (!string.IsNullOrWhiteSpace(message.JobId) && _pending.TryGetValue(message.JobId, out var waiter))
-                    waiter.TrySetResult(message);
+                LastState = "idle";
+                if (!string.IsNullOrWhiteSpace(message.JobId) &&
+                    _pending.TryGetValue(message.JobId, out var resultWaiter))
+                {
+                    resultWaiter.TrySetResult(message);
+                }
                 else
+                {
                     await unsolicited(message);
+                }
+
+                SignalStateChange();
+                break;
+
+            case "error":
+                if (!string.IsNullOrWhiteSpace(message.JobId) &&
+                    _pending.TryGetValue(message.JobId, out var errorWaiter))
+                {
+                    errorWaiter.TrySetResult(message);
+                    LastState = !string.IsNullOrWhiteSpace(BoundUrl) && ExtensionConnected ? "idle" : "error";
+                }
+                else
+                {
+                    LastState = "error";
+                    await unsolicited(message);
+                }
+
                 SignalStateChange();
                 break;
 
             case "observedResult":
-                if (!string.IsNullOrWhiteSpace(_activeJobId) && _pending.TryGetValue(_activeJobId, out var activeWaiter))
+                if (!string.IsNullOrWhiteSpace(_activeJobId) &&
+                    _pending.TryGetValue(_activeJobId, out var activeWaiter))
                 {
                     activeWaiter.TrySetResult(message with { Type = "result", JobId = _activeJobId });
                     LastState = "idle";
@@ -124,6 +152,7 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
                 {
                     await unsolicited(message);
                 }
+
                 break;
         }
     }
@@ -132,9 +161,19 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
     {
         while (true)
         {
-            if (ExtensionConnected && !string.IsNullOrWhiteSpace(BoundUrl) &&
+            if (ExtensionConnected &&
+                !string.IsNullOrWhiteSpace(BoundUrl) &&
                 (LastState is "idle" or "connected"))
+            {
                 return;
+            }
+
+            if (LastState == "error" && ExtensionConnected && !string.IsNullOrWhiteSpace(BoundUrl))
+            {
+                logger.LogWarning("Recovering stale error state for bound ChatGPT tab");
+                LastState = "idle";
+                return;
+            }
 
             logger.LogInformation("Waiting for bound ChatGPT tab to become idle; state={State}", LastState);
             await _stateChanged.WaitAsync(ct);
@@ -143,7 +182,8 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
 
     private void SignalStateChange()
     {
-        try { _stateChanged.Release(); } catch (SemaphoreFullException) { }
+        try { _stateChanged.Release(); }
+        catch (SemaphoreFullException) { }
     }
 
     private async Task SendAsync(BridgeCommand command, CancellationToken ct)
@@ -153,6 +193,7 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
             throw new InvalidOperationException("Edge extension is not connected.");
 
         var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(command, Protocol.Json));
+
         await _socketSendGate.WaitAsync(ct);
         try
         {

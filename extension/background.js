@@ -15,20 +15,25 @@ function connect() {
     state = 'connected';
     clearInterval(keepAliveTimer);
     keepAliveTimer = setInterval(() => send({ type: 'ping' }), 20000);
+
     const saved = await chrome.storage.local.get(['boundTabId', 'boundUrl']);
     boundTabId = saved.boundTabId ?? boundTabId;
     boundUrl = saved.boundUrl ?? boundUrl;
+
     if (boundTabId) {
       try {
         const tab = await chrome.tabs.get(boundTabId);
         if (tab?.url === boundUrl && tab.url.startsWith('https://chatgpt.com/')) {
+          await ensureContentScript(boundTabId);
           send({ type: 'bind', url: tab.url, title: tab.title || 'ChatGPT' });
         } else {
           await clearBinding();
           send({ type: 'unbind' });
         }
-      } catch {
+      } catch (error) {
         await clearBinding();
+        send({ type: 'unbind' });
+        state = 'error';
       }
     }
   });
@@ -36,11 +41,20 @@ function connect() {
   socket.addEventListener('message', async event => {
     let command;
     try { command = JSON.parse(event.data); } catch { return; }
-    if (!boundTabId) return;
+    if (!boundTabId) {
+      send({ type: 'error', jobId: command?.jobId, error: 'No ChatGPT tab is bound.' });
+      return;
+    }
+
     try {
+      await ensureContentScript(boundTabId);
       await chrome.tabs.sendMessage(boundTabId, { kind: 'bridgeCommand', command });
     } catch (error) {
-      send({ type: 'error', jobId: command.jobId, error: `Bound ChatGPT tab is unavailable: ${error?.message || error}` });
+      send({
+        type: 'error',
+        jobId: command?.jobId,
+        error: `Bound ChatGPT tab is unavailable: ${error?.message || error}`
+      });
     }
   });
 
@@ -66,6 +80,23 @@ async function clearBinding() {
   await chrome.storage.local.remove(['boundTabId', 'boundUrl']);
 }
 
+async function ensureContentScript(tabId) {
+  try {
+    const ping = await chrome.tabs.sendMessage(tabId, { kind: 'connectorPing' });
+    if (ping?.ok) return;
+  } catch {
+    // Existing pages do not receive a newly installed/reloaded content script automatically.
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content.js']
+  });
+
+  const ping = await chrome.tabs.sendMessage(tabId, { kind: 'connectorPing' });
+  if (!ping?.ok) throw new Error('ChatGPT content script did not initialize.');
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.kind === 'edgeEvent') {
     const payload = { ...message.payload };
@@ -81,11 +112,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Open the ChatGPT conversation you want to bind first.' });
         return;
       }
-      boundTabId = tab.id;
-      boundUrl = tab.url;
-      await chrome.storage.local.set({ boundTabId, boundUrl });
-      send({ type: 'bind', url: tab.url, title: tab.title || 'ChatGPT' });
-      sendResponse({ ok: true, title: tab.title, url: tab.url });
+
+      try {
+        await ensureContentScript(tab.id);
+        boundTabId = tab.id;
+        boundUrl = tab.url;
+        await chrome.storage.local.set({ boundTabId, boundUrl });
+        send({ type: 'bind', url: tab.url, title: tab.title || 'ChatGPT' });
+        sendResponse({ ok: true, title: tab.title, url: tab.url });
+      } catch (error) {
+        sendResponse({ ok: false, error: error?.message || String(error) });
+      }
     })();
     return true;
   }

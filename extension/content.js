@@ -1,4 +1,7 @@
 (() => {
+  if (window.__gptTgConnectorLoaded) return;
+  window.__gptTgConnectorLoaded = true;
+
   const SELECTORS = {
     composer: [
       '#prompt-textarea',
@@ -102,7 +105,10 @@
 
     if (node && text && fingerprint(node, text) !== lastForwardedFingerprint) {
       scheduleCompletion();
+      return;
     }
+
+    setState('idle');
   }
 
   function scheduleCompletion() {
@@ -113,6 +119,7 @@
       const currentFingerprint = node && text ? fingerprint(node, text) : null;
       const stillBusy = Boolean(first(SELECTORS.stop));
       if (stillBusy) return evaluate();
+
       if (!currentFingerprint || currentFingerprint === lastForwardedFingerprint) {
         wasBusy = false;
         setState('idle');
@@ -124,6 +131,7 @@
       const payload = activeJobId
         ? { type: 'result', jobId: activeJobId, text, error: error || null }
         : { type: 'observedResult', eventId: crypto.randomUUID(), text, error: error || null };
+
       emit(payload);
       activeJobId = null;
       wasBusy = false;
@@ -133,6 +141,7 @@
 
   function setComposerText(composer, text) {
     composer.focus();
+
     if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
       const proto = composer instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -156,8 +165,9 @@
 
   async function sendPrompt(command) {
     if (first(SELECTORS.stop)) throw new Error('ChatGPT is still busy with the previous generation.');
+
     const composer = first(SELECTORS.composer);
-    if (!composer) throw new Error('ChatGPT composer was not found. Refresh ChatGPT and try again.');
+    if (!composer) throw new Error('ChatGPT composer was not found.');
 
     activeJobId = command.jobId;
     setState('submitting');
@@ -169,8 +179,16 @@
       sendButton.click();
     } else {
       const form = composer.closest('form');
-      if (form?.requestSubmit) form.requestSubmit();
-      else composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+      if (form?.requestSubmit) {
+        form.requestSubmit();
+      } else {
+        composer.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Enter',
+          code: 'Enter',
+          bubbles: true,
+          cancelable: true
+        }));
+      }
     }
 
     setState('waiting');
@@ -178,6 +196,11 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.kind === 'connectorPing') {
+      sendResponse({ ok: true, state: lastState || 'ready' });
+      return;
+    }
+
     if (message?.kind !== 'bridgeCommand') return;
     const command = message.command;
     if (command?.type !== 'sendPrompt') return;
@@ -190,6 +213,7 @@
         setState('idle');
         sendResponse({ ok: false, error: error?.message || String(error) });
       });
+
     return true;
   });
 
@@ -197,7 +221,12 @@
     clearTimeout(window.__gptTgConnectorMutationTimer);
     window.__gptTgConnectorMutationTimer = setTimeout(evaluate, 120);
   });
-  observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  });
 
   evaluate();
 })();
