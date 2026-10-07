@@ -55,8 +55,13 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         if (!ExtensionConnected || string.IsNullOrWhiteSpace(BoundUrl))
             throw new InvalidOperationException("Edge is not ready or no ChatGPT tab is bound.");
 
-        if (HasActiveJob || QueueLength > 0)
-            throw new InvalidOperationException("Wait for the active/queued ChatGPT job to finish before switching chats.");
+        if (HasActiveJob ||
+            QueueLength > 0 ||
+            LastState is "submitting" or "waiting" or "generating" or "tool_running" or "finishing")
+        {
+            throw new InvalidOperationException(
+                "Wait for the current ChatGPT activity to finish before switching chats.");
+        }
 
         if (!Uri.TryCreate(url, UriKind.Absolute, out var target) ||
             !string.Equals(target.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
