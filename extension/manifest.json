@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "name": "GPT TG Connector",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Connect an already-open ChatGPT tab to the local GPT Telegram Connector bridge.",
   "permissions": ["tabs", "storage", "activeTab", "scripting"],
   "host_permissions": [
