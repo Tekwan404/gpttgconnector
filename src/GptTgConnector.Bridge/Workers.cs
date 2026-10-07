@@ -88,11 +88,117 @@ public sealed class TelegramPollingWorker(
             return;
         }
 
+
+        if (text.Equals("/current", StringComparison.OrdinalIgnoreCase))
+        {
+            await telegram.SendMessageAsync(
+                chatId,
+                string.IsNullOrWhiteSpace(runtime.BoundUrl)
+                    ? "No ChatGPT chat is currently bound."
+                    : $"{runtime.BoundTitle ?? "ChatGPT"}\n{runtime.BoundUrl}",
+                ct);
+            return;
+        }
+
+        if (text.Equals("/chats", StringComparison.OrdinalIgnoreCase))
+        {
+            var chats = runtime.GetRecentChats();
+
+            if (chats.Count == 0)
+            {
+                await telegram.SendMessageAsync(
+                    chatId,
+                    "No recent ChatGPT chats have been recorded yet.",
+                    ct);
+                return;
+            }
+
+            var lines = chats
+                .Select((chat, index) =>
+                {
+                    var current = string.Equals(
+                        chat.Url,
+                        runtime.BoundUrl,
+                        StringComparison.OrdinalIgnoreCase)
+                        ? " ★"
+                        : string.Empty;
+
+                    return $"{index + 1}. {chat.Title}{current}";
+                });
+
+            await telegram.SendMessageAsync(
+                chatId,
+                "Recent chats:\n" +
+                string.Join("\n", lines) +
+                "\n\nUse /chat N to switch.",
+                ct);
+            return;
+        }
+
+        if (text.Equals("/new", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                await runtime.NavigateAsync("https://chatgpt.com/", ct);
+                await telegram.SendMessageAsync(chatId, "Opening a new ChatGPT chat.", ct);
+            }
+            catch (Exception ex)
+            {
+                await telegram.SendMessageAsync(chatId, $"Cannot open a new chat: {ex.Message}", ct);
+            }
+
+            return;
+        }
+
+        if (text.StartsWith("/chat", StringComparison.OrdinalIgnoreCase))
+        {
+            var parts = text.Split(
+                ' ',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            if (parts.Length != 2 || !int.TryParse(parts[1], out var number))
+            {
+                await telegram.SendMessageAsync(
+                    chatId,
+                    "Usage: /chat 1 (choose 1-5 from /chats).",
+                    ct);
+                return;
+            }
+
+            var chats = runtime.GetRecentChats();
+
+            if (number < 1 || number > chats.Count)
+            {
+                await telegram.SendMessageAsync(
+                    chatId,
+                    $"Chat #{number} is not in the recent list. Use /chats.",
+                    ct);
+                return;
+            }
+
+            var selected = chats[number - 1];
+
+            try
+            {
+                await runtime.NavigateAsync(selected.Url, ct);
+                await telegram.SendMessageAsync(
+                    chatId,
+                    $"Switching to: {selected.Title}",
+                    ct);
+            }
+            catch (Exception ex)
+            {
+                await telegram.SendMessageAsync(chatId, $"Cannot switch chat: {ex.Message}", ct);
+            }
+
+            return;
+        }
+
         if (text.StartsWith('/'))
         {
             await telegram.SendMessageAsync(
                 chatId,
-                "Commands: /id, /status. Any normal text is sent to the bound ChatGPT tab.",
+                "Commands: /id, /status, /current, /new, /chats, /chat N. Any normal text is sent to the bound ChatGPT tab.",
                 ct);
             return;
         }
