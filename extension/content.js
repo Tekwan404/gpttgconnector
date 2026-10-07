@@ -28,19 +28,28 @@
   let lastState = null;
   let wasBusy = false;
   let settleTimer = null;
+  let submissionTimer = null;
   let lastForwardedFingerprint = null;
   let initialized = false;
 
+  let baselineUserCount = 0;
+  let baselineAssistantCount = 0;
+  let baselineAssistantFingerprint = null;
+  let promptAccepted = false;
+
   const first = selectors => selectors.map(s => document.querySelector(s)).find(Boolean) || null;
   const emit = payload => chrome.runtime.sendMessage({ kind: 'edgeEvent', payload }).catch(() => {});
+
+  function userMessages() {
+    return [...document.querySelectorAll('[data-message-author-role="user"]')];
+  }
 
   function assistantMessages() {
     return [...document.querySelectorAll('[data-message-author-role="assistant"]')];
   }
 
   function latestAssistant() {
-    const items = assistantMessages();
-    return items.at(-1) || null;
+    return assistantMessages().at(-1) || null;
   }
 
   function assistantText(node) {
@@ -55,12 +64,7 @@
   }
 
   function findUiError() {
-    const candidates = [
-      '[role="alert"]',
-      '[data-testid*="error"]',
-      '[class*="error"]'
-    ];
-    for (const selector of candidates) {
+    for (const selector of ['[role="alert"]', '[data-testid*="error"]', '[class*="error"]']) {
       for (const el of document.querySelectorAll(selector)) {
         const text = (el.innerText || '').trim();
         if (text && text.length < 1000 && el.offsetParent !== null) return text;
@@ -80,14 +84,74 @@
     emit({ type: 'state', jobId: activeJobId, state, detail });
   }
 
+  function clearJob() {
+    clearTimeout(submissionTimer);
+    activeJobId = null;
+    promptAccepted = false;
+    wasBusy = false;
+    baselineUserCount = 0;
+    baselineAssistantCount = 0;
+    baselineAssistantFingerprint = null;
+  }
+
+  function failActiveJob(message) {
+    if (!activeJobId) return;
+    const jobId = activeJobId;
+    clearJob();
+    emit({ type: 'error', jobId, error: message });
+    setState('idle');
+  }
+
   function evaluate() {
-    const node = latestAssistant();
+    const assistants = assistantMessages();
+    const node = assistants.at(-1) || null;
     const text = assistantText(node);
+    const currentFingerprint = node && text ? fingerprint(node, text) : null;
     const busy = Boolean(first(SELECTORS.stop));
 
     if (!initialized) {
       initialized = true;
-      if (node && text) lastForwardedFingerprint = fingerprint(node, text);
+      if (currentFingerprint) lastForwardedFingerprint = currentFingerprint;
+    }
+
+    if (activeJobId) {
+      if (!promptAccepted) {
+        const accepted =
+          userMessages().length > baselineUserCount ||
+          assistants.length > baselineAssistantCount ||
+          busy;
+
+        if (!accepted) {
+          setState('waiting', 'waiting_for_prompt_accept');
+          return;
+        }
+
+        promptAccepted = true;
+        clearTimeout(submissionTimer);
+        setState(busy ? 'generating' : 'waiting', 'prompt_accepted');
+      }
+
+      if (busy) {
+        wasBusy = true;
+        clearTimeout(settleTimer);
+        setState(hasToolActivity(node) ? 'tool_running' : 'generating');
+        return;
+      }
+
+      const hasNewAssistant =
+        assistants.length > baselineAssistantCount ||
+        (currentFingerprint &&
+          currentFingerprint !== baselineAssistantFingerprint &&
+          currentFingerprint !== lastForwardedFingerprint);
+
+      if (hasNewAssistant && text) {
+        setState('finishing');
+        scheduleCompletion();
+        return;
+      }
+
+      setState('waiting', 'waiting_for_assistant');
+      return;
     }
 
     if (busy) {
@@ -103,7 +167,7 @@
       return;
     }
 
-    if (node && text && fingerprint(node, text) !== lastForwardedFingerprint) {
+    if (currentFingerprint && currentFingerprint !== lastForwardedFingerprint) {
       scheduleCompletion();
       return;
     }
@@ -114,11 +178,36 @@
   function scheduleCompletion() {
     clearTimeout(settleTimer);
     settleTimer = setTimeout(() => {
-      const node = latestAssistant();
+      const assistants = assistantMessages();
+      const node = assistants.at(-1) || null;
       const text = assistantText(node);
       const currentFingerprint = node && text ? fingerprint(node, text) : null;
-      const stillBusy = Boolean(first(SELECTORS.stop));
-      if (stillBusy) return evaluate();
+
+      if (first(SELECTORS.stop)) {
+        evaluate();
+        return;
+      }
+
+      if (activeJobId) {
+        const hasNewAssistant =
+          assistants.length > baselineAssistantCount ||
+          (currentFingerprint &&
+            currentFingerprint !== baselineAssistantFingerprint &&
+            currentFingerprint !== lastForwardedFingerprint);
+
+        if (!hasNewAssistant || !currentFingerprint) {
+          setState('waiting', 'assistant_not_ready');
+          return;
+        }
+
+        const jobId = activeJobId;
+        const error = findUiError();
+        lastForwardedFingerprint = currentFingerprint;
+        clearJob();
+        emit({ type: 'result', jobId, text, error: error || null });
+        setState('idle');
+        return;
+      }
 
       if (!currentFingerprint || currentFingerprint === lastForwardedFingerprint) {
         wasBusy = false;
@@ -128,13 +217,8 @@
 
       const error = findUiError();
       lastForwardedFingerprint = currentFingerprint;
-      const payload = activeJobId
-        ? { type: 'result', jobId: activeJobId, text, error: error || null }
-        : { type: 'observedResult', eventId: crypto.randomUUID(), text, error: error || null };
-
-      emit(payload);
-      activeJobId = null;
       wasBusy = false;
+      emit({ type: 'observedResult', eventId: crypto.randomUUID(), text, error: error || null });
       setState('idle');
     }, 1800);
   }
@@ -143,7 +227,9 @@
     composer.focus();
 
     if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
-      const proto = composer instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const proto = composer instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
       setter?.call(composer, text);
       composer.dispatchEvent(new Event('input', { bubbles: true }));
@@ -154,27 +240,80 @@
     if (composer.isContentEditable) {
       composer.replaceChildren();
       composer.focus();
+
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+
       const inserted = document.execCommand?.('insertText', false, text);
       if (!inserted) composer.textContent = text;
-      composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+
+      composer.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        inputType: 'insertText',
+        data: text
+      }));
       return;
     }
 
     throw new Error('Unsupported ChatGPT composer element.');
   }
 
+  function waitForEnabledSendButton(timeoutMs = 2500) {
+    const immediate = first(SELECTORS.send);
+    if (immediate && !immediate.disabled) return Promise.resolve(immediate);
+
+    return new Promise(resolve => {
+      let finished = false;
+      const finish = value => {
+        if (finished) return;
+        finished = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(value);
+      };
+
+      const observer = new MutationObserver(() => {
+        const button = first(SELECTORS.send);
+        if (button && !button.disabled) finish(button);
+      });
+
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['disabled', 'aria-disabled']
+      });
+
+      const timer = setTimeout(() => finish(first(SELECTORS.send)), timeoutMs);
+    });
+  }
+
   async function sendPrompt(command) {
+    if (activeJobId) throw new Error('Another bridge job is already active.');
     if (first(SELECTORS.stop)) throw new Error('ChatGPT is still busy with the previous generation.');
 
     const composer = first(SELECTORS.composer);
     if (!composer) throw new Error('ChatGPT composer was not found.');
 
+    const assistants = assistantMessages();
+    const lastAssistant = assistants.at(-1) || null;
+    const lastAssistantText = assistantText(lastAssistant);
+
     activeJobId = command.jobId;
+    baselineUserCount = userMessages().length;
+    baselineAssistantCount = assistants.length;
+    baselineAssistantFingerprint =
+      lastAssistant && lastAssistantText ? fingerprint(lastAssistant, lastAssistantText) : null;
+    promptAccepted = false;
+    wasBusy = false;
+
     setState('submitting');
     setComposerText(composer, command.text || '');
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
-    const sendButton = first(SELECTORS.send);
+    const sendButton = await waitForEnabledSendButton();
     if (sendButton && !sendButton.disabled) {
       sendButton.click();
     } else {
@@ -191,13 +330,24 @@
       }
     }
 
-    setState('waiting');
-    setTimeout(evaluate, 250);
+    setState('waiting', 'waiting_for_prompt_accept');
+
+    submissionTimer = setTimeout(() => {
+      if (!activeJobId || promptAccepted) return;
+      const uiError = findUiError();
+      failActiveJob(
+        uiError
+          ? `ChatGPT did not accept the prompt: ${uiError}`
+          : 'ChatGPT did not accept the prompt within 12 seconds. The message was not confirmed in the conversation.'
+      );
+    }, 12000);
+
+    evaluate();
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.kind === 'connectorPing') {
-      sendResponse({ ok: true, state: lastState || 'ready' });
+      sendResponse({ ok: true, state: lastState || 'ready', activeJobId });
       return;
     }
 
@@ -208,8 +358,9 @@
     sendPrompt(command)
       .then(() => sendResponse({ ok: true }))
       .catch(error => {
-        emit({ type: 'error', jobId: command.jobId, error: error?.message || String(error) });
-        activeJobId = null;
+        const jobId = command.jobId;
+        if (activeJobId === jobId) clearJob();
+        emit({ type: 'error', jobId, error: error?.message || String(error) });
         setState('idle');
         sendResponse({ ok: false, error: error?.message || String(error) });
       });
@@ -219,13 +370,15 @@
 
   const observer = new MutationObserver(() => {
     clearTimeout(window.__gptTgConnectorMutationTimer);
-    window.__gptTgConnectorMutationTimer = setTimeout(evaluate, 120);
+    window.__gptTgConnectorMutationTimer = setTimeout(evaluate, 100);
   });
 
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
-    characterData: true
+    characterData: true,
+    attributes: true,
+    attributeFilter: ['disabled', 'aria-disabled']
   });
 
   evaluate();
