@@ -19,6 +19,7 @@ public sealed record EdgeEnvelope(
     string? State = null,
     string? Detail = null,
     string? Text = null,
+    string? Html = null,
     string? Error = null,
     string? EventId = null);
 

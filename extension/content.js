@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.1.4';
+  const CONTENT_SCRIPT_VERSION = '0.1.5';
   if (window.__gptTgConnectorLoaded === CONTENT_SCRIPT_VERSION) return;
   window.__gptTgConnectorLoaded = CONTENT_SCRIPT_VERSION;
 
@@ -60,6 +60,174 @@
 
   function readText(node) {
     return normalizeText(node?.innerText || node?.textContent || '');
+  }
+
+  function escapeHtml(value) {
+    return (value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function escapeHtmlAttribute(value) {
+    return escapeHtml(value).replace(/"/g, '&quot;');
+  }
+
+  function tableToText(table) {
+    const rows = [...table.querySelectorAll('tr')]
+      .map(row => [...row.children]
+        .filter(cell => cell.tagName === 'TH' || cell.tagName === 'TD')
+        .map(cell => normalizeText(cell.innerText || cell.textContent || '')))
+      .filter(row => row.length > 0);
+
+    if (rows.length === 0) return '';
+
+    const columnCount = Math.max(...rows.map(row => row.length));
+    const widths = Array.from({ length: columnCount }, (_, index) =>
+      Math.max(1, ...rows.map(row => (row[index] || '').length))
+    );
+
+    const renderRow = row =>
+      row.map((cell, index) => (cell || '').padEnd(widths[index])).join(' │ ').trimEnd();
+
+    const lines = rows.map(renderRow);
+    const firstRow = table.querySelector('tr');
+    const hasHeader = Boolean(firstRow?.querySelector('th'));
+
+    if (hasHeader && lines.length > 1) {
+      const separator = widths.map(width => '─'.repeat(width)).join('─┼─');
+      lines.splice(1, 0, separator);
+    }
+
+    return lines.join('\n');
+  }
+
+  function serializeList(list, ordered) {
+    const items = [...list.children].filter(child => child.tagName === 'LI');
+    const lines = [];
+
+    items.forEach((item, index) => {
+      const nestedLists = [...item.children].filter(
+        child => child.tagName === 'UL' || child.tagName === 'OL'
+      );
+
+      let body = '';
+      for (const child of item.childNodes) {
+        if (
+          child.nodeType === Node.ELEMENT_NODE &&
+          (child.tagName === 'UL' || child.tagName === 'OL')
+        ) {
+          continue;
+        }
+        body += serializeTelegramNode(child);
+      }
+
+      body = body.replace(/\n+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+      const prefix = ordered ? `${index + 1}. ` : '• ';
+      lines.push(prefix + body);
+
+      for (const nested of nestedLists) {
+        const nestedText = serializeList(nested, nested.tagName === 'OL')
+          .trim()
+          .split('\n')
+          .map(line => `  ${line}`)
+          .join('\n');
+        if (nestedText) lines.push(nestedText);
+      }
+    });
+
+    return lines.join('\n') + '\n';
+  }
+
+  function serializeTelegramNode(node) {
+    if (!node) return '';
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      return escapeHtml((node.nodeValue || '').replace(/\s+/g, ' '));
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+    const tag = node.tagName;
+
+    if (tag === 'BR') return '\n';
+    if (tag === 'HR') return '\n────────\n';
+
+    if (tag === 'TABLE') {
+      const table = tableToText(node);
+      return table ? `<pre>${escapeHtml(table)}</pre>\n\n` : '';
+    }
+
+    if (tag === 'PRE') {
+      const text = normalizeText(node.innerText || node.textContent || '');
+      return text ? `<pre>${escapeHtml(text)}</pre>\n\n` : '';
+    }
+
+    if (tag === 'CODE') {
+      const text = normalizeText(node.textContent || '');
+      return text ? `<code>${escapeHtml(text)}</code>` : '';
+    }
+
+    const children = () =>
+      [...node.childNodes].map(serializeTelegramNode).join('');
+
+    if (/^H[1-6]$/.test(tag)) {
+      const value = children().trim();
+      return value ? `<b>${value}</b>\n\n` : '';
+    }
+
+    if (tag === 'STRONG' || tag === 'B') {
+      return `<b>${children()}</b>`;
+    }
+
+    if (tag === 'EM' || tag === 'I') {
+      return `<i>${children()}</i>`;
+    }
+
+    if (tag === 'U' || tag === 'INS') {
+      return `<u>${children()}</u>`;
+    }
+
+    if (tag === 'S' || tag === 'STRIKE' || tag === 'DEL') {
+      return `<s>${children()}</s>`;
+    }
+
+    if (tag === 'A') {
+      const href = node.getAttribute('href') || '';
+      const label = children().trim() || escapeHtml(href);
+
+      try {
+        const url = new URL(href, location.href);
+        if (url.protocol === 'http:' || url.protocol === 'https:') {
+          return `<a href="${escapeHtmlAttribute(url.href)}">${label}</a>`;
+        }
+      } catch {
+      }
+
+      return label;
+    }
+
+    if (tag === 'UL') return serializeList(node, false);
+    if (tag === 'OL') return serializeList(node, true);
+
+    if (tag === 'BLOCKQUOTE') {
+      const value = children().trim();
+      return value ? `<blockquote>${value}</blockquote>\n\n` : '';
+    }
+
+    if (tag === 'P') {
+      const value = children().trim();
+      return value ? `${value}\n\n` : '';
+    }
+
+    return children();
+  }
+
+  function telegramHtml(node) {
+    return serializeTelegramNode(node)
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
 
   function isVisible(node) {
@@ -174,6 +342,7 @@
       const item = primaryChanged.at(-1);
       return {
         text: item.text,
+        html: telegramHtml(item.node),
         fingerprint: `primary|${primaryChanged.length}|${item.text.length}|${item.text.slice(-180)}`
       };
     }
@@ -193,8 +362,14 @@
     const text = normalizeText(pieces.join('\n\n'));
     if (!text) return null;
 
+    const html = leafChanged
+      .map(item => telegramHtml(item.node))
+      .filter(Boolean)
+      .join('\n\n');
+
     return {
       text,
+      html,
       fingerprint: `leaves|${pieces.length}|${text.length}|${text.slice(-180)}`
     };
   }
@@ -305,6 +480,7 @@
           type: 'result',
           jobId,
           text: delta.text,
+          html: delta.html || null,
           error: error || null
         });
 
@@ -327,6 +503,7 @@
         type: 'observedResult',
         eventId: crypto.randomUUID(),
         text: delta.text,
+        html: delta.html || null,
         error: error || null
       });
 

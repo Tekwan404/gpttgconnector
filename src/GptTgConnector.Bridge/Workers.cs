@@ -161,21 +161,33 @@ public sealed class JobWorker(
         EdgeEnvelope result,
         CancellationToken ct)
     {
-        var parts = new List<string>();
+        var fallbackText = !string.IsNullOrWhiteSpace(result.Text)
+            ? result.Text.Trim()
+            : "ChatGPT finished, but no readable final text was found.";
 
-        if (!string.IsNullOrWhiteSpace(result.Text))
-            parts.Add(result.Text.Trim());
+        if (!string.IsNullOrWhiteSpace(result.Html))
+        {
+            await telegram.SendFormattedMessageAsync(
+                chatId,
+                result.Html.Trim(),
+                fallbackText,
+                ct);
+        }
+        else
+        {
+            await telegram.SendMessageAsync(
+                chatId,
+                fallbackText,
+                ct);
+        }
 
         if (!string.IsNullOrWhiteSpace(result.Error))
-            parts.Add($"⚠ ChatGPT/UI error: {result.Error.Trim()}");
-
-        if (parts.Count == 0)
-            parts.Add("ChatGPT finished, but no readable final text was found.");
-
-        await telegram.SendMessageAsync(
-            chatId,
-            string.Join("\n\n", parts),
-            ct);
+        {
+            await telegram.SendMessageAsync(
+                chatId,
+                $"⚠ ChatGPT/UI error: {result.Error.Trim()}",
+                ct);
+        }
     }
 }
 
@@ -238,9 +250,18 @@ public static class WebSocketEndpoint
                             return;
 
                         var text = unsolicited.Text?.Trim();
+                        var html = unsolicited.Html?.Trim();
                         var error = unsolicited.Error?.Trim();
 
-                        if (!string.IsNullOrWhiteSpace(text))
+                        if (!string.IsNullOrWhiteSpace(html))
+                        {
+                            await telegram.SendFormattedMessageAsync(
+                                options.AllowedChatId,
+                                html,
+                                text ?? "ChatGPT finished, but no readable final text was found.",
+                                context.RequestAborted);
+                        }
+                        else if (!string.IsNullOrWhiteSpace(text))
                         {
                             await telegram.SendMessageAsync(
                                 options.AllowedChatId,
