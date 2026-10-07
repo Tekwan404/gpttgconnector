@@ -1,5 +1,5 @@
 const BRIDGE_URL = 'ws://127.0.0.1:8765/ws';
-const CONTENT_SCRIPT_VERSION = '0.1.6';
+const CONTENT_SCRIPT_VERSION = '0.1.7';
 
 let socket = null;
 let reconnectTimer = null;
@@ -14,9 +14,11 @@ function connect() {
   }
 
   state = 'connecting';
-  socket = new WebSocket(BRIDGE_URL);
+  const ws = new WebSocket(BRIDGE_URL);
+  socket = ws;
 
-  socket.addEventListener('open', async () => {
+  ws.addEventListener('open', async () => {
+    if (socket !== ws) return;
     state = 'connected';
     clearInterval(keepAliveTimer);
     keepAliveTimer = setInterval(() => send({ type: 'ping' }), 20000);
@@ -49,7 +51,8 @@ function connect() {
     }
   });
 
-  socket.addEventListener('message', async event => {
+  ws.addEventListener('message', async event => {
+    if (socket !== ws) return;
     let command;
     try {
       command = JSON.parse(event.data);
@@ -85,8 +88,13 @@ function connect() {
     }
   });
 
-  socket.addEventListener('close', scheduleReconnect);
-  socket.addEventListener('error', () => {
+  ws.addEventListener('close', () => {
+    if (socket !== ws) return;
+    scheduleReconnect();
+  });
+
+  ws.addEventListener('error', () => {
+    if (socket !== ws) return;
     state = 'error';
   });
 }
@@ -272,45 +280,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (tabId !== boundTabId) return;
+  if (tabId !== boundTabId || !changeInfo.url) return;
 
-  if (changeInfo.url) {
-    if (!changeInfo.url.startsWith('https://chatgpt.com/')) {
-      await clearBinding();
-      send({ type: 'unbind' });
-      return;
-    }
-
-    boundUrl = changeInfo.url;
-    await chrome.storage.local.set({ boundTabId, boundUrl });
-    send({
-      type: 'bind',
-      url: boundUrl,
-      title: tab?.title || 'ChatGPT'
-    });
+  if (!changeInfo.url.startsWith('https://chatgpt.com/')) {
+    await clearBinding();
+    send({ type: 'unbind' });
+    return;
   }
 
-  if (
-    changeInfo.status === 'complete' &&
-    tab?.url?.startsWith('https://chatgpt.com/')
-  ) {
-    try {
-      await ensureContentScript(tabId);
-      boundUrl = tab.url;
-      await chrome.storage.local.set({ boundTabId, boundUrl });
-      send({
-        type: 'bind',
-        url: boundUrl,
-        title: tab.title || 'ChatGPT'
-      });
-    } catch (error) {
-      state = 'error';
-      send({
-        type: 'error',
-        error: `ChatGPT tab reload failed: ${error?.message || error}`
-      });
-    }
-  }
+  // ChatGPT changes conversations inside the same tab. Follow that URL
+  // without reloading the page or reinjecting the content script.
+  boundUrl = changeInfo.url;
+  await chrome.storage.local.set({ boundTabId, boundUrl });
+
+  send({
+    type: 'bind',
+    url: boundUrl,
+    title: tab?.title || 'ChatGPT'
+  });
 });
 
 chrome.tabs.onRemoved.addListener(async tabId => {
