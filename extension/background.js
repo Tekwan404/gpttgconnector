@@ -1,5 +1,5 @@
 const BRIDGE_URL = 'ws://127.0.0.1:8765/ws';
-const CONTENT_SCRIPT_VERSION = '0.1.3';
+const CONTENT_SCRIPT_VERSION = '0.1.4';
 
 let socket = null;
 let reconnectTimer = null;
@@ -271,13 +271,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
-  if (tabId !== boundTabId || !changeInfo.url || changeInfo.url === boundUrl) {
-    return;
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (tabId !== boundTabId) return;
+
+  if (changeInfo.url) {
+    if (!changeInfo.url.startsWith('https://chatgpt.com/')) {
+      await clearBinding();
+      send({ type: 'unbind' });
+      return;
+    }
+
+    boundUrl = changeInfo.url;
+    await chrome.storage.local.set({ boundTabId, boundUrl });
+    send({
+      type: 'bind',
+      url: boundUrl,
+      title: tab?.title || 'ChatGPT'
+    });
   }
 
-  await clearBinding();
-  send({ type: 'unbind' });
+  if (
+    changeInfo.status === 'complete' &&
+    tab?.url?.startsWith('https://chatgpt.com/')
+  ) {
+    try {
+      await ensureContentScript(tabId);
+      boundUrl = tab.url;
+      await chrome.storage.local.set({ boundTabId, boundUrl });
+      send({
+        type: 'bind',
+        url: boundUrl,
+        title: tab.title || 'ChatGPT'
+      });
+    } catch (error) {
+      state = 'error';
+      send({
+        type: 'error',
+        error: `ChatGPT tab reload failed: ${error?.message || error}`
+      });
+    }
+  }
 });
 
 chrome.tabs.onRemoved.addListener(async tabId => {

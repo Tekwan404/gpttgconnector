@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.1.3';
+  const CONTENT_SCRIPT_VERSION = '0.1.4';
   if (window.__gptTgConnectorLoaded === CONTENT_SCRIPT_VERSION) return;
   window.__gptTgConnectorLoaded = CONTENT_SCRIPT_VERSION;
 
@@ -71,6 +71,45 @@
 
   function composerElement() {
     return first(SELECTORS.composer);
+  }
+
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function sendButtonElement(composer = composerElement()) {
+    const direct = first(SELECTORS.send);
+    if (direct) return direct;
+
+    const form = composer?.closest('form');
+    if (!form) return null;
+
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) return submit;
+
+    const buttons = [...form.querySelectorAll('button')].filter(isVisible);
+    return buttons.find(button => {
+      const label = normalizeText(
+        `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''} ${button.textContent || ''}`
+      ).toLowerCase();
+
+      return /send|submit|отправ/.test(label);
+    }) || null;
+  }
+
+  function composerDiagnostics() {
+    const composer = composerElement();
+    const send = sendButtonElement(composer);
+    const form = composer?.closest('form');
+
+    return [
+      `composer=${composer ? composer.tagName.toLowerCase() : 'none'}`,
+      `editable=${Boolean(composer?.isContentEditable)}`,
+      `composerText=${composerText().length}`,
+      `form=${Boolean(form)}`,
+      `send=${Boolean(send)}`,
+      `sendDisabled=${send ? Boolean(send.disabled || send.getAttribute('aria-disabled') === 'true') : 'na'}`
+    ].join(' ');
   }
 
   function isComposerContent(node) {
@@ -176,7 +215,8 @@
       `primary=${primaryBlocks().length}`,
       `leaves=${leafBlocks().length}`,
       `roleNodes=${roles.roleNodes}`,
-      `turnShells=${roles.turnShells}`
+      `turnShells=${roles.turnShells}`,
+      composerDiagnostics()
     ].join(' ');
   }
 
@@ -392,9 +432,11 @@
     throw new Error('Unsupported ChatGPT composer element.');
   }
 
-  function waitForEnabledSendButton(timeoutMs = 2500) {
-    const immediate = first(SELECTORS.send);
-    if (immediate && !immediate.disabled) return Promise.resolve(immediate);
+  function waitForEnabledSendButton(composer, timeoutMs = 2500) {
+    const immediate = sendButtonElement(composer);
+    if (immediate && !immediate.disabled && immediate.getAttribute('aria-disabled') !== 'true') {
+      return Promise.resolve(immediate);
+    }
 
     return new Promise(resolve => {
       let finished = false;
@@ -408,8 +450,14 @@
       };
 
       const watcher = new MutationObserver(() => {
-        const button = first(SELECTORS.send);
-        if (button && !button.disabled) finish(button);
+        const button = sendButtonElement(composer);
+        if (
+          button &&
+          !button.disabled &&
+          button.getAttribute('aria-disabled') !== 'true'
+        ) {
+          finish(button);
+        }
       });
 
       watcher.observe(document.documentElement, {
@@ -420,10 +468,76 @@
       });
 
       const timer = setTimeout(
-        () => finish(first(SELECTORS.send)),
+        () => finish(sendButtonElement(composer)),
         timeoutMs
       );
     });
+  }
+
+  async function waitForComposerValue(expectedText, timeoutMs = 1800) {
+    const expected = normalizeText(expectedText);
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (composerText() === expected) return true;
+      await delay(60);
+    }
+
+    return composerText() === expected;
+  }
+
+  function promptAcceptedSignal() {
+    return (
+      Boolean(first(SELECTORS.stop)) ||
+      composerText().length === 0 ||
+      Boolean(responseDelta())
+    );
+  }
+
+  function dispatchEnter(composer) {
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      composer.dispatchEvent(new KeyboardEvent(type, {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true
+      }));
+    }
+  }
+
+  async function submitPrompt(composer) {
+    const sendButton = await waitForEnabledSendButton(composer);
+
+    if (
+      sendButton &&
+      !sendButton.disabled &&
+      sendButton.getAttribute('aria-disabled') !== 'true'
+    ) {
+      sendButton.click();
+      await delay(350);
+      if (promptAcceptedSignal()) return 'button';
+    }
+
+    dispatchEnter(composer);
+    await delay(350);
+    if (promptAcceptedSignal()) return 'enter';
+
+    const form = composer.closest('form');
+    if (form?.requestSubmit) {
+      const submit = sendButtonElement(composer);
+      if (submit?.type === 'submit' && !submit.disabled) {
+        form.requestSubmit(submit);
+      } else {
+        form.requestSubmit();
+      }
+
+      await delay(350);
+      if (promptAcceptedSignal()) return 'form';
+    }
+
+    return null;
   }
 
   async function sendPrompt(command) {
@@ -449,28 +563,18 @@
     setState('submitting', domDiagnostics());
     setComposerText(composer, activePromptText);
 
-    const sendButton = await waitForEnabledSendButton();
-
-    if (sendButton && !sendButton.disabled) {
-      sendButton.click();
-    } else {
-      const form = composer.closest('form');
-
-      if (form?.requestSubmit) {
-        form.requestSubmit();
-      } else {
-        composer.dispatchEvent(new KeyboardEvent('keydown', {
-          key: 'Enter',
-          code: 'Enter',
-          bubbles: true,
-          cancelable: true
-        }));
-      }
+    const composerReady = await waitForComposerValue(activePromptText);
+    if (!composerReady) {
+      throw new Error(
+        `ChatGPT composer did not retain the prompt. ${domDiagnostics()}`
+      );
     }
+
+    const submitMethod = await submitPrompt(composer);
 
     setState(
       'waiting',
-      `waiting_for_prompt_accept ${domDiagnostics()}`
+      `waiting_for_prompt_accept submit=${submitMethod || 'none'} ${domDiagnostics()}`
     );
 
     submissionTimer = setTimeout(() => {
