@@ -89,6 +89,10 @@ function connect() {
         reloadingConversationTabs.delete(boundTabId);
       }
 
+      if (directNavigationTabs.has(boundTabId)) {
+        await waitForTabReady(boundTabId);
+      }
+
       await ensureContentScript(boundTabId);
       const response = await chrome.tabs.sendMessage(boundTabId, {
         kind: 'bridgeCommand',
