@@ -24,3 +24,24 @@ jobs:
           node --check extension/background.js
           node --check extension/content.js
           node --check extension/popup.js
+      - name: Validate PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in @('start.ps1', 'setup.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file),
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+
+            if ($errors.Count -gt 0) {
+              Write-Host "PowerShell parse errors in $file"
+              $errors | ForEach-Object { Write-Host $_.Message }
+              $failed = $true
+            }
+          }
+
+          if ($failed) { exit 1 }
