@@ -17,6 +17,13 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
     private readonly ConcurrentDictionary<string, TaskCompletionSource<EdgeEnvelope>> _pending = new();
     private readonly SemaphoreSlim _socketSendGate = new(1, 1);
     private readonly SemaphoreSlim _stateChanged = new(0, int.MaxValue);
+    private readonly object _chatHistoryLock = new();
+    private readonly List<RecentChat> _recentChats = LoadRecentChats();
+
+    private static readonly string ChatHistoryPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "GptTgConnector",
+        "chats.json");
 
     private WebSocket? _socket;
     private int _queued;
@@ -31,6 +38,35 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
     public int QueueLength => Math.Max(0, Volatile.Read(ref _queued));
     public bool HasActiveJob => !string.IsNullOrWhiteSpace(_activeJobId);
     public ChannelReader<BridgeJob> Jobs => _jobs.Reader;
+
+    public IReadOnlyList<RecentChat> GetRecentChats()
+    {
+        lock (_chatHistoryLock)
+        {
+            return _recentChats
+                .OrderByDescending(chat => chat.LastUsedAt)
+                .Take(5)
+                .ToArray();
+        }
+    }
+
+    public async Task NavigateAsync(string url, CancellationToken ct)
+    {
+        if (!ExtensionConnected || string.IsNullOrWhiteSpace(BoundUrl))
+            throw new InvalidOperationException("Edge is not ready or no ChatGPT tab is bound.");
+
+        if (HasActiveJob || QueueLength > 0)
+            throw new InvalidOperationException("Wait for the active/queued ChatGPT job to finish before switching chats.");
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var target) ||
+            !string.Equals(target.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(target.Host, "chatgpt.com", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Only chatgpt.com navigation is allowed.");
+        }
+
+        await SendAsync(new BridgeCommand("navigate", Url: target.ToString()), ct);
+    }
 
     public void Attach(WebSocket socket)
     {
@@ -100,6 +136,10 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
             case "bind":
                 BoundUrl = message.Url;
                 BoundTitle = message.Title;
+
+                if (IsConversationUrl(BoundUrl))
+                    RememberChat(BoundUrl!, BoundTitle);
+
                 LastState = "idle";
                 LastDetail = null;
                 logger.LogInformation("Bound ChatGPT tab: {Title} {Url}", BoundTitle, BoundUrl);
@@ -214,6 +254,77 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         }
     }
 
+    private static bool IsConversationUrl(string? url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed))
+            return false;
+
+        return string.Equals(parsed.Host, "chatgpt.com", StringComparison.OrdinalIgnoreCase) &&
+               parsed.AbsolutePath.StartsWith("/c/", StringComparison.OrdinalIgnoreCase) &&
+               parsed.AbsolutePath.Length > 3;
+    }
+
+    private void RememberChat(string url, string? title)
+    {
+        var cleanTitle = string.IsNullOrWhiteSpace(title)
+            ? "ChatGPT"
+            : title.Trim();
+
+        lock (_chatHistoryLock)
+        {
+            _recentChats.RemoveAll(chat =>
+                string.Equals(chat.Url, url, StringComparison.OrdinalIgnoreCase));
+
+            _recentChats.Insert(0, new RecentChat(
+                url,
+                cleanTitle,
+                DateTimeOffset.UtcNow));
+
+            if (_recentChats.Count > 5)
+                _recentChats.RemoveRange(5, _recentChats.Count - 5);
+
+            SaveRecentChatsUnsafe();
+        }
+    }
+
+    private static List<RecentChat> LoadRecentChats()
+    {
+        try
+        {
+            if (!File.Exists(ChatHistoryPath))
+                return [];
+
+            var json = File.ReadAllText(ChatHistoryPath);
+            return JsonSerializer.Deserialize<List<RecentChat>>(json, Protocol.Json)?
+                .Where(chat => IsConversationUrl(chat.Url))
+                .OrderByDescending(chat => chat.LastUsedAt)
+                .Take(5)
+                .ToList() ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private void SaveRecentChatsUnsafe()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(ChatHistoryPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+                Directory.CreateDirectory(directory);
+
+            File.WriteAllText(
+                ChatHistoryPath,
+                JsonSerializer.Serialize(_recentChats, Protocol.Json));
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not persist recent ChatGPT chats");
+        }
+    }
+
     private void SignalStateChange()
     {
         try
@@ -251,3 +362,9 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         }
     }
 }
+
+
+public sealed record RecentChat(
+    string Url,
+    string Title,
+    DateTimeOffset LastUsedAt);
