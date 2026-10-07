@@ -1,5 +1,5 @@
 const BRIDGE_URL = 'ws://127.0.0.1:8765/ws';
-const CONTENT_SCRIPT_VERSION = '0.1.2';
+const CONTENT_SCRIPT_VERSION = '0.1.3';
 
 let socket = null;
 let reconnectTimer = null;
