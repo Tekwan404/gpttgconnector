@@ -1,6 +1,7 @@
 (() => {
-  if (window.__gptTgConnectorLoaded) return;
-  window.__gptTgConnectorLoaded = true;
+  const CONTENT_SCRIPT_VERSION = '0.1.2';
+  if (window.__gptTgConnectorLoaded === CONTENT_SCRIPT_VERSION) return;
+  window.__gptTgConnectorLoaded = CONTENT_SCRIPT_VERSION;
 
   const SELECTORS = {
     composer: [
@@ -26,6 +27,7 @@
 
   let activeJobId = null;
   let lastState = null;
+  let lastDetail = null;
   let wasBusy = false;
   let settleTimer = null;
   let submissionTimer = null;
@@ -39,28 +41,141 @@
 
   const first = selectors => selectors.map(s => document.querySelector(s)).find(Boolean) || null;
   const emit = payload => chrome.runtime.sendMessage({ kind: 'edgeEvent', payload }).catch(() => {});
+  const root = () => document.querySelector('main') || document;
+
+  function inferredRole(turn) {
+    if (!turn) return null;
+
+    const direct = turn.getAttribute?.('data-turn');
+    if (direct === 'user' || direct === 'assistant') return direct;
+
+    const roleNode = turn.matches?.('[data-message-author-role], [data-role], [data-message-author]')
+      ? turn
+      : turn.querySelector?.('[data-message-author-role], [data-role], [data-message-author]');
+
+    const attr =
+      roleNode?.getAttribute('data-message-author-role') ||
+      roleNode?.getAttribute('data-role') ||
+      roleNode?.getAttribute('data-message-author');
+
+    if (attr === 'user' || attr === 'assistant') return attr;
+
+    const heading = [...turn.querySelectorAll?.('h1,h2,h3,h4,h5,h6,[aria-label]') || []]
+      .map(el => `${el.getAttribute?.('aria-label') || ''} ${el.textContent || ''}`.trim())
+      .join(' ')
+      .toLowerCase();
+
+    if (/\b(you said|user said|вы сказали|пользователь)\b/.test(heading)) return 'user';
+    if (/\b(chatgpt said|assistant said|chatgpt|assistant|ассистент)\b/.test(heading)) return 'assistant';
+
+    return null;
+  }
+
+  function roleMessages(role) {
+    const container = root();
+    const result = [];
+    const seen = new Set();
+
+    const add = node => {
+      if (!node || seen.has(node)) return;
+      seen.add(node);
+      result.push(node);
+    };
+
+    for (const selector of [
+      `[data-message-author-role="${role}"]`,
+      `[data-message-author="${role}"]`,
+      `[data-role="${role}"]`,
+      `[data-turn="${role}"]`
+    ]) {
+      for (const node of container.querySelectorAll(selector)) add(node);
+    }
+
+    for (const turn of container.querySelectorAll(
+      '[data-testid^="conversation-turn-"], [data-testid*="conversation-turn"]'
+    )) {
+      if (inferredRole(turn) !== role) continue;
+
+      const roleNode = turn.querySelector(
+        `[data-message-author-role="${role}"], [data-message-author="${role}"], [data-role="${role}"]`
+      );
+      add(roleNode || turn);
+    }
+
+    if (role === 'assistant') {
+      for (const node of container.querySelectorAll('.agent-turn')) add(node);
+    }
+
+    result.sort((a, b) => {
+      if (a === b) return 0;
+      const relation = a.compareDocumentPosition(b);
+      if (relation & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (relation & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+
+    return result;
+  }
 
   function userMessages() {
-    return [...document.querySelectorAll('[data-message-author-role="user"]')];
+    return roleMessages('user');
   }
 
   function assistantMessages() {
-    return [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+    return roleMessages('assistant');
   }
 
-  function latestAssistant() {
-    return assistantMessages().at(-1) || null;
-  }
-
-  function assistantText(node) {
+  function messageText(node) {
     if (!node) return '';
-    const markdown = node.querySelector('.markdown, [data-message-content], [class*="markdown"]');
-    return (markdown?.innerText || node.innerText || '').trim();
+
+    const preferred = node.querySelector?.(
+      '.markdown, [data-message-content], .prose, [class*="markdown"]'
+    );
+
+    const roleNode = node.matches?.(
+      '[data-message-author-role], [data-message-author], [data-role]'
+    )
+      ? node
+      : node.querySelector?.('[data-message-author-role], [data-message-author], [data-role]');
+
+    return (preferred?.innerText || roleNode?.innerText || node.innerText || node.textContent || '').trim();
+  }
+
+  function messageIdentity(node) {
+    if (!node) return '';
+
+    const roleNode = node.matches?.(
+      '[data-message-author-role], [data-message-author], [data-role]'
+    )
+      ? node
+      : node.querySelector?.('[data-message-author-role], [data-message-author], [data-role]');
+
+    const turn = node.matches?.('[data-turn-id], [data-testid*="conversation-turn"]')
+      ? node
+      : node.closest?.('[data-turn-id], [data-testid*="conversation-turn"]');
+
+    return (
+      roleNode?.getAttribute('data-message-id') ||
+      roleNode?.getAttribute('data-message-uuid') ||
+      turn?.getAttribute('data-turn-id') ||
+      turn?.getAttribute('data-testid') ||
+      node.id ||
+      ''
+    );
   }
 
   function fingerprint(node, text) {
-    const id = node?.getAttribute('data-message-id') || node?.id || '';
-    return `${id}|${text.length}|${text.slice(-160)}`;
+    return `${messageIdentity(node)}|${text.length}|${text.slice(-160)}`;
+  }
+
+  function domDiagnostics() {
+    const container = root();
+    return [
+      `users=${userMessages().length}`,
+      `assistants=${assistantMessages().length}`,
+      `roleNodes=${container.querySelectorAll('[data-message-author-role]').length}`,
+      `turnShells=${container.querySelectorAll('[data-turn], [data-testid*="conversation-turn"]').length}`
+    ].join(' ');
   }
 
   function findUiError() {
@@ -75,12 +190,13 @@
 
   function hasToolActivity(node) {
     if (!node) return false;
-    return Boolean(node.querySelector('[data-testid*="tool"], [data-tool], [data-testid*="action"]'));
+    return Boolean(node.querySelector?.('[data-testid*="tool"], [data-tool], [data-testid*="action"]'));
   }
 
   function setState(state, detail = null) {
-    if (state === lastState && !detail) return;
+    if (state === lastState && detail === lastDetail) return;
     lastState = state;
+    lastDetail = detail;
     emit({ type: 'state', jobId: activeJobId, state, detail });
   }
 
@@ -99,13 +215,13 @@
     const jobId = activeJobId;
     clearJob();
     emit({ type: 'error', jobId, error: message });
-    setState('idle');
+    setState('idle', domDiagnostics());
   }
 
   function evaluate() {
     const assistants = assistantMessages();
     const node = assistants.at(-1) || null;
-    const text = assistantText(node);
+    const text = messageText(node);
     const currentFingerprint = node && text ? fingerprint(node, text) : null;
     const busy = Boolean(first(SELECTORS.stop));
 
@@ -122,19 +238,25 @@
           busy;
 
         if (!accepted) {
-          setState('waiting', 'waiting_for_prompt_accept');
+          setState('waiting', `waiting_for_prompt_accept ${domDiagnostics()}`);
           return;
         }
 
         promptAccepted = true;
         clearTimeout(submissionTimer);
-        setState(busy ? 'generating' : 'waiting', 'prompt_accepted');
+        setState(
+          busy ? 'generating' : 'waiting',
+          `prompt_accepted ${domDiagnostics()}`
+        );
       }
 
       if (busy) {
         wasBusy = true;
         clearTimeout(settleTimer);
-        setState(hasToolActivity(node) ? 'tool_running' : 'generating');
+        setState(
+          hasToolActivity(node) ? 'tool_running' : 'generating',
+          domDiagnostics()
+        );
         return;
       }
 
@@ -145,24 +267,27 @@
           currentFingerprint !== lastForwardedFingerprint);
 
       if (hasNewAssistant && text) {
-        setState('finishing');
+        setState('finishing', domDiagnostics());
         scheduleCompletion();
         return;
       }
 
-      setState('waiting', 'waiting_for_assistant');
+      setState('waiting', `waiting_for_assistant ${domDiagnostics()}`);
       return;
     }
 
     if (busy) {
       wasBusy = true;
       clearTimeout(settleTimer);
-      setState(hasToolActivity(node) ? 'tool_running' : 'generating');
+      setState(
+        hasToolActivity(node) ? 'tool_running' : 'generating',
+        domDiagnostics()
+      );
       return;
     }
 
     if (wasBusy) {
-      setState('finishing');
+      setState('finishing', domDiagnostics());
       scheduleCompletion();
       return;
     }
@@ -172,7 +297,7 @@
       return;
     }
 
-    setState('idle');
+    setState('idle', domDiagnostics());
   }
 
   function scheduleCompletion() {
@@ -180,7 +305,7 @@
     settleTimer = setTimeout(() => {
       const assistants = assistantMessages();
       const node = assistants.at(-1) || null;
-      const text = assistantText(node);
+      const text = messageText(node);
       const currentFingerprint = node && text ? fingerprint(node, text) : null;
 
       if (first(SELECTORS.stop)) {
@@ -196,7 +321,7 @@
             currentFingerprint !== lastForwardedFingerprint);
 
         if (!hasNewAssistant || !currentFingerprint) {
-          setState('waiting', 'assistant_not_ready');
+          setState('waiting', `assistant_not_ready ${domDiagnostics()}`);
           return;
         }
 
@@ -205,13 +330,13 @@
         lastForwardedFingerprint = currentFingerprint;
         clearJob();
         emit({ type: 'result', jobId, text, error: error || null });
-        setState('idle');
+        setState('idle', domDiagnostics());
         return;
       }
 
       if (!currentFingerprint || currentFingerprint === lastForwardedFingerprint) {
         wasBusy = false;
-        setState('idle');
+        setState('idle', domDiagnostics());
         return;
       }
 
@@ -219,7 +344,7 @@
       lastForwardedFingerprint = currentFingerprint;
       wasBusy = false;
       emit({ type: 'observedResult', eventId: crypto.randomUUID(), text, error: error || null });
-      setState('idle');
+      setState('idle', domDiagnostics());
     }, 1800);
   }
 
@@ -267,20 +392,21 @@
 
     return new Promise(resolve => {
       let finished = false;
+
       const finish = value => {
         if (finished) return;
         finished = true;
-        observer.disconnect();
+        watcher.disconnect();
         clearTimeout(timer);
         resolve(value);
       };
 
-      const observer = new MutationObserver(() => {
+      const watcher = new MutationObserver(() => {
         const button = first(SELECTORS.send);
         if (button && !button.disabled) finish(button);
       });
 
-      observer.observe(document.documentElement, {
+      watcher.observe(document.documentElement, {
         childList: true,
         subtree: true,
         attributes: true,
@@ -300,7 +426,7 @@
 
     const assistants = assistantMessages();
     const lastAssistant = assistants.at(-1) || null;
-    const lastAssistantText = assistantText(lastAssistant);
+    const lastAssistantText = messageText(lastAssistant);
 
     activeJobId = command.jobId;
     baselineUserCount = userMessages().length;
@@ -310,10 +436,11 @@
     promptAccepted = false;
     wasBusy = false;
 
-    setState('submitting');
+    setState('submitting', domDiagnostics());
     setComposerText(composer, command.text || '');
 
     const sendButton = await waitForEnabledSendButton();
+
     if (sendButton && !sendButton.disabled) {
       sendButton.click();
     } else {
@@ -330,7 +457,7 @@
       }
     }
 
-    setState('waiting', 'waiting_for_prompt_accept');
+    setState('waiting', `waiting_for_prompt_accept ${domDiagnostics()}`);
 
     submissionTimer = setTimeout(() => {
       if (!activeJobId || promptAccepted) return;
@@ -338,7 +465,7 @@
       failActiveJob(
         uiError
           ? `ChatGPT did not accept the prompt: ${uiError}`
-          : 'ChatGPT did not accept the prompt within 12 seconds. The message was not confirmed in the conversation.'
+          : `ChatGPT did not accept the prompt within 12 seconds. ${domDiagnostics()}`
       );
     }, 12000);
 
@@ -347,7 +474,13 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.kind === 'connectorPing') {
-      sendResponse({ ok: true, state: lastState || 'ready', activeJobId });
+      sendResponse({
+        ok: true,
+        version: CONTENT_SCRIPT_VERSION,
+        state: lastState || 'ready',
+        activeJobId,
+        diagnostics: domDiagnostics()
+      });
       return;
     }
 
@@ -361,7 +494,7 @@
         const jobId = command.jobId;
         if (activeJobId === jobId) clearJob();
         emit({ type: 'error', jobId, error: error?.message || String(error) });
-        setState('idle');
+        setState('idle', domDiagnostics());
         sendResponse({ ok: false, error: error?.message || String(error) });
       });
 
@@ -378,7 +511,7 @@
     subtree: true,
     characterData: true,
     attributes: true,
-    attributeFilter: ['disabled', 'aria-disabled']
+    attributeFilter: ['disabled', 'aria-disabled', 'data-turn', 'data-message-author-role']
   });
 
   evaluate();
