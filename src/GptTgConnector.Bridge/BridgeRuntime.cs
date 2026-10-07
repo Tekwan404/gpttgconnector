@@ -17,15 +17,19 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
     private readonly ConcurrentDictionary<string, TaskCompletionSource<EdgeEnvelope>> _pending = new();
     private readonly SemaphoreSlim _socketSendGate = new(1, 1);
     private readonly SemaphoreSlim _stateChanged = new(0, int.MaxValue);
+
     private WebSocket? _socket;
     private int _queued;
     private string? _activeJobId;
 
     public string? BoundUrl { get; private set; }
     public string? BoundTitle { get; private set; }
-    public string LastState { get; private set; } = "disconnected";\n    public string? LastDetail { get; private set; }
+    public string LastState { get; private set; } = "disconnected";
+    public string? LastDetail { get; private set; }
+
     public bool ExtensionConnected => _socket is { State: WebSocketState.Open };
     public int QueueLength => Math.Max(0, Volatile.Read(ref _queued));
+    public bool HasActiveJob => !string.IsNullOrWhiteSpace(_activeJobId);
     public ChannelReader<BridgeJob> Jobs => _jobs.Reader;
 
     public void Attach(WebSocket socket)
@@ -34,6 +38,7 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         try { old?.Abort(); } catch { }
 
         LastState = "connected";
+        LastDetail = null;
         logger.LogInformation("Edge extension connected");
         SignalStateChange();
     }
@@ -44,6 +49,7 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
 
         _socket = null;
         LastState = "disconnected";
+        LastDetail = null;
         logger.LogWarning("Edge extension disconnected");
         SignalStateChange();
     }
@@ -61,7 +67,9 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
     {
         await WaitUntilReadyAsync(ct);
 
-        var completion = new TaskCompletionSource<EdgeEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completion = new TaskCompletionSource<EdgeEnvelope>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
         if (!_pending.TryAdd(job.Id, completion))
             throw new InvalidOperationException("Duplicate job id.");
 
@@ -76,7 +84,9 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         finally
         {
             _pending.TryRemove(job.Id, out _);
-            if (_activeJobId == job.Id) _activeJobId = null;
+
+            if (_activeJobId == job.Id)
+                _activeJobId = null;
         }
     }
 
@@ -91,6 +101,7 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
                 BoundUrl = message.Url;
                 BoundTitle = message.Title;
                 LastState = "idle";
+                LastDetail = null;
                 logger.LogInformation("Bound ChatGPT tab: {Title} {Url}", BoundTitle, BoundUrl);
                 SignalStateChange();
                 break;
@@ -99,18 +110,26 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
                 BoundUrl = null;
                 BoundTitle = null;
                 LastState = ExtensionConnected ? "connected" : "disconnected";
+                LastDetail = null;
                 logger.LogWarning("ChatGPT tab binding cleared");
                 SignalStateChange();
                 break;
 
             case "state":
                 LastState = message.State ?? "working";
-                logger.LogInformation("State {State} job={JobId} detail={Detail}", LastState, message.JobId, message.Detail);
+                LastDetail = message.Detail;
+                logger.LogInformation(
+                    "State {State} job={JobId} detail={Detail}",
+                    LastState,
+                    message.JobId,
+                    LastDetail);
                 SignalStateChange();
                 break;
 
             case "result":
                 LastState = "idle";
+                LastDetail = null;
+
                 if (!string.IsNullOrWhiteSpace(message.JobId) &&
                     _pending.TryGetValue(message.JobId, out var resultWaiter))
                 {
@@ -125,11 +144,16 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
                 break;
 
             case "error":
+                LastDetail = message.Error;
+
                 if (!string.IsNullOrWhiteSpace(message.JobId) &&
                     _pending.TryGetValue(message.JobId, out var errorWaiter))
                 {
                     errorWaiter.TrySetResult(message);
-                    LastState = !string.IsNullOrWhiteSpace(BoundUrl) && ExtensionConnected ? "idle" : "error";
+                    LastState =
+                        !string.IsNullOrWhiteSpace(BoundUrl) && ExtensionConnected
+                            ? "idle"
+                            : "error";
                 }
                 else
                 {
@@ -144,8 +168,11 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
                 if (!string.IsNullOrWhiteSpace(_activeJobId) &&
                     _pending.TryGetValue(_activeJobId, out var activeWaiter))
                 {
-                    activeWaiter.TrySetResult(message with { Type = "result", JobId = _activeJobId });
+                    activeWaiter.TrySetResult(
+                        message with { Type = "result", JobId = _activeJobId });
+
                     LastState = "idle";
+                    LastDetail = null;
                     SignalStateChange();
                 }
                 else
@@ -163,41 +190,60 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
         {
             if (ExtensionConnected &&
                 !string.IsNullOrWhiteSpace(BoundUrl) &&
-                (LastState is "idle" or "connected"))
+                LastState is "idle" or "connected")
             {
                 return;
             }
 
-            if (LastState == "error" && ExtensionConnected && !string.IsNullOrWhiteSpace(BoundUrl))
+            if (LastState == "error" &&
+                ExtensionConnected &&
+                !string.IsNullOrWhiteSpace(BoundUrl))
             {
                 logger.LogWarning("Recovering stale error state for bound ChatGPT tab");
                 LastState = "idle";
+                LastDetail = null;
                 return;
             }
 
-            logger.LogInformation("Waiting for bound ChatGPT tab to become idle; state={State}", LastState);
+            logger.LogInformation(
+                "Waiting for bound ChatGPT tab to become idle; state={State} detail={Detail}",
+                LastState,
+                LastDetail);
+
             await _stateChanged.WaitAsync(ct);
         }
     }
 
     private void SignalStateChange()
     {
-        try { _stateChanged.Release(); }
-        catch (SemaphoreFullException) { }
+        try
+        {
+            _stateChanged.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+        }
     }
 
     private async Task SendAsync(BridgeCommand command, CancellationToken ct)
     {
         var socket = _socket;
+
         if (socket is null || socket.State != WebSocketState.Open)
             throw new InvalidOperationException("Edge extension is not connected.");
 
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(command, Protocol.Json));
+        var bytes = Encoding.UTF8.GetBytes(
+            JsonSerializer.Serialize(command, Protocol.Json));
 
         await _socketSendGate.WaitAsync(ct);
+
         try
         {
-            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, ct);
+            await socket.SendAsync(
+                new ArraySegment<byte>(bytes),
+                WebSocketMessageType.Text,
+                true,
+                ct);
         }
         finally
         {
