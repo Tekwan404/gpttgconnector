@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "116",
+  "name": "GPT TG Connector",
+  "version": "0.1.0",
+  "description": "Connect an already-open ChatGPT tab to the local GPT Telegram Connector bridge.",
+  "permissions": ["tabs", "storage", "activeTab"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "GPT TG Connector"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
