@@ -45,6 +45,45 @@ WebSocket держит background service worker расширения. Content s
 
 ---
 
+## Самый простой запуск на Windows
+
+После `git pull` больше не нужно каждый раз заново вводить `$env:Bridge__...`.
+
+Один раз выполни:
+
+```powershell
+.\setup.ps1
+```
+
+Скрипт спросит:
+
+- Telegram bot token;
+- `chat_id`;
+- `user_id`.
+
+Он сохранит их локально в:
+
+```text
+src\GptTgConnector.Bridge\appsettings.Local.json
+```
+
+Этот файл уже добавлен в `.gitignore` и в Git не попадёт.
+
+После этого обычный запуск:
+
+```powershell
+.\start.ps1
+```
+
+Либо двойным кликом:
+
+```text
+start.cmd
+```
+
+Если ID ещё не знаешь, можно временно запускать bridge только с token старым способом, написать боту `/id`, затем выполнить `setup.ps1`.
+
+
 # Установка
 
 ## 1. Что нужно
