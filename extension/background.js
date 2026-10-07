@@ -7,6 +7,7 @@ let boundTabId = null;
 let boundUrl = null;
 let state = 'disconnected';
 let keepAliveTimer = null;
+const reloadingConversationTabs = new Set();
 
 function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
@@ -70,6 +71,11 @@ function connect() {
     }
 
     try {
+      if (reloadingConversationTabs.has(boundTabId)) {
+        await waitForTabReady(boundTabId);
+        reloadingConversationTabs.delete(boundTabId);
+      }
+
       await ensureContentScript(boundTabId);
       const response = await chrome.tabs.sendMessage(boundTabId, {
         kind: 'bridgeCommand',
@@ -129,6 +135,37 @@ async function pingContent(tabId) {
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function conversationId(url) {
+  if (!url) return null;
+
+  try {
+    const parsed = new URL(url);
+    if (parsed.origin !== 'https://chatgpt.com') return null;
+
+    const match = parsed.pathname.match(/\/c\/([^/]+)/);
+    return match?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitForTabReady(tabId, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab?.status === 'complete') return tab;
+    } catch {
+      throw new Error('Bound ChatGPT tab is unavailable.');
+    }
+
+    await delay(100);
+  }
+
+  throw new Error('Timed out waiting for the ChatGPT tab to finish reloading.');
 }
 
 async function waitForExpectedContent(tabId, timeoutMs = 10000) {
@@ -247,24 +284,80 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (tabId !== boundTabId || !changeInfo.url) return;
+  if (tabId !== boundTabId) return;
 
-  if (!changeInfo.url.startsWith('https://chatgpt.com/')) {
-    await clearBinding();
-    send({ type: 'unbind' });
+  if (changeInfo.url) {
+    if (!changeInfo.url.startsWith('https://chatgpt.com/')) {
+      reloadingConversationTabs.delete(tabId);
+      await clearBinding();
+      send({ type: 'unbind' });
+      return;
+    }
+
+    const previousConversationId = conversationId(boundUrl);
+    const nextConversationId = conversationId(changeInfo.url);
+
+    boundUrl = changeInfo.url;
+    await chrome.storage.local.set({ boundTabId, boundUrl });
+
+    send({
+      type: 'bind',
+      url: boundUrl,
+      title: tab?.title || 'ChatGPT'
+    });
+
+    // ChatGPT SPA navigation can leave the ProseMirror composer visually
+    // present but disconnected from its Send-button state. Do one real page
+    // reload only when moving from one existing /c/<id> conversation to
+    // another. Do not reload the transition from "new chat" to its first
+    // generated /c/<id>, because that can happen while a response is running.
+    if (
+      previousConversationId &&
+      nextConversationId &&
+      previousConversationId !== nextConversationId
+    ) {
+      reloadingConversationTabs.add(tabId);
+
+      try {
+        await chrome.tabs.reload(tabId);
+      } catch (error) {
+        reloadingConversationTabs.delete(tabId);
+        send({
+          type: 'error',
+          error: `Could not refresh the newly selected ChatGPT conversation: ${error?.message || error}`
+        });
+      }
+    }
+
     return;
   }
 
-  // ChatGPT changes conversations inside the same tab. Follow that URL
-  // without reloading the page or reinjecting the content script.
-  boundUrl = changeInfo.url;
-  await chrome.storage.local.set({ boundTabId, boundUrl });
+  if (
+    changeInfo.status === 'complete' &&
+    reloadingConversationTabs.has(tabId)
+  ) {
+    reloadingConversationTabs.delete(tabId);
 
-  send({
-    type: 'bind',
-    url: boundUrl,
-    title: tab?.title || 'ChatGPT'
-  });
+    try {
+      const ping = await ensureContentScript(tabId);
+      const refreshed = await chrome.tabs.get(tabId);
+
+      boundUrl = refreshed.url;
+      await chrome.storage.local.set({ boundTabId, boundUrl });
+
+      send({
+        type: 'bind',
+        url: boundUrl,
+        title: refreshed.title || tab?.title || 'ChatGPT',
+        detail: `conversation_refreshed content=${ping.version}`
+      });
+    } catch (error) {
+      send({
+        type: 'error',
+        error: `ChatGPT conversation refresh failed: ${error?.message || error}`
+      });
+    }
+  }
 });
 
 chrome.tabs.onRemoved.addListener(async tabId => {
