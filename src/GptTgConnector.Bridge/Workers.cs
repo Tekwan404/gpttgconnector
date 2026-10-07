@@ -11,6 +11,8 @@ public sealed class TelegramPollingWorker(
     ILogger<TelegramPollingWorker> logger) : BackgroundService
 {
     private long _offset;
+    private string? _lastPrompt;
+    private string? _lastPromptUrl;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -46,6 +48,12 @@ public sealed class TelegramPollingWorker(
 
     private async Task HandleAsync(TelegramUpdate update, CancellationToken ct)
     {
+        if (update.CallbackQuery is not null)
+        {
+            await HandleCallbackAsync(update.CallbackQuery, ct);
+            return;
+        }
+
         var message = update.Message;
         var text = message?.Text?.Trim();
         var chatId = message?.Chat?.Id ?? 0;
@@ -87,6 +95,47 @@ public sealed class TelegramPollingWorker(
                 ct);
             return;
         }
+        if (text.Equals("/retry", StringComparison.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(_lastPrompt))
+            {
+                await telegram.SendMessageAsync(chatId, "Nothing to retry yet.", ct);
+                return;
+            }
+
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(_lastPromptUrl) &&
+                    !string.Equals(_lastPromptUrl, runtime.BoundUrl, StringComparison.OrdinalIgnoreCase))
+                {
+                    await runtime.NavigateAsync(_lastPromptUrl, ct);
+                }
+
+                await QueuePromptAsync(chatId, _lastPrompt, _lastPromptUrl, ct);
+            }
+            catch (Exception ex)
+            {
+                await telegram.SendMessageAsync(chatId, $"Cannot retry: {ex.Message}", ct);
+            }
+
+            return;
+        }
+
+        if (text.Equals("/cancel", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                await runtime.CancelAsync(ct);
+                await telegram.SendMessageAsync(chatId, "Stopping ChatGPT generation…", ct);
+            }
+            catch (Exception ex)
+            {
+                await telegram.SendMessageAsync(chatId, $"Cannot cancel: {ex.Message}", ct);
+            }
+
+            return;
+        }
+
 
 
         if (text.Equals("/current", StringComparison.OrdinalIgnoreCase))
@@ -126,11 +175,10 @@ public sealed class TelegramPollingWorker(
                     return $"{index + 1}. {chat.Title}{current}";
                 });
 
-            await telegram.SendMessageAsync(
+            await telegram.SendMessageWithKeyboardAsync(
                 chatId,
-                "Recent chats:\n" +
-                string.Join("\n", lines) +
-                "\n\nUse /chat N to switch.",
+                "Recent chats:\n" + string.Join("\n", lines),
+                BuildChatsKeyboard(chats),
                 ct);
             return;
         }
@@ -198,7 +246,7 @@ public sealed class TelegramPollingWorker(
         {
             await telegram.SendMessageAsync(
                 chatId,
-                "Commands: /id, /status, /current, /new, /chats, /chat N. Any normal text is sent to the bound ChatGPT tab.",
+                "Commands: /id, /status, /current, /new, /chats, /chat N, /retry, /cancel. Any normal text is sent to the bound ChatGPT tab.",
                 ct);
             return;
         }
@@ -212,6 +260,44 @@ public sealed class TelegramPollingWorker(
             return;
         }
 
+        string? targetUrl = null;
+        var replyMessageId = message?.ReplyToMessage?.MessageId ?? 0;
+
+        if (replyMessageId > 0 &&
+            runtime.TryGetConversationForTelegramMessage(replyMessageId, out var replyUrl))
+        {
+            targetUrl = replyUrl;
+
+            if (!string.Equals(replyUrl, runtime.BoundUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    await runtime.NavigateAsync(replyUrl, ct);
+                }
+                catch (Exception ex)
+                {
+                    await telegram.SendMessageAsync(
+                        chatId,
+                        $"Cannot return to the replied ChatGPT chat: {ex.Message}",
+                        ct);
+                    return;
+                }
+            }
+        }
+
+        targetUrl ??= runtime.BoundUrl;
+        _lastPrompt = text;
+        _lastPromptUrl = targetUrl;
+
+        await QueuePromptAsync(chatId, text, targetUrl, ct);
+    }
+
+    private async Task QueuePromptAsync(
+        long chatId,
+        string text,
+        string? targetUrl,
+        CancellationToken ct)
+    {
         var job = new BridgeJob(
             Guid.NewGuid().ToString("N"),
             chatId,
@@ -223,6 +309,127 @@ public sealed class TelegramPollingWorker(
             chatId,
             $"Queued ({runtime.QueueLength}).",
             ct);
+
+        _lastPrompt = text;
+        _lastPromptUrl = targetUrl;
+    }
+
+    private async Task HandleCallbackAsync(
+        TelegramCallbackQuery callback,
+        CancellationToken ct)
+    {
+        var chatId = callback.Message?.Chat?.Id ?? 0;
+        var userId = callback.From?.Id ?? 0;
+        var data = callback.Data?.Trim() ?? string.Empty;
+
+        if (chatId == 0 || !IsAllowed(chatId, userId))
+        {
+            await telegram.AnswerCallbackQueryAsync(
+                callback.Id,
+                "Not allowed.",
+                ct);
+            return;
+        }
+
+        try
+        {
+            if (data.Equals("chat:new", StringComparison.Ordinal))
+            {
+                await runtime.NavigateAsync("https://chatgpt.com/", ct);
+                await telegram.AnswerCallbackQueryAsync(
+                    callback.Id,
+                    "Opening a new chat.",
+                    ct);
+                return;
+            }
+
+            if (data.StartsWith("chat:", StringComparison.Ordinal))
+            {
+                var conversationId = data["chat:".Length..];
+                var selected = runtime.GetRecentChats().FirstOrDefault(chat =>
+                    string.Equals(
+                        ConversationId(chat.Url),
+                        conversationId,
+                        StringComparison.OrdinalIgnoreCase));
+
+                if (selected is null)
+                {
+                    await telegram.AnswerCallbackQueryAsync(
+                        callback.Id,
+                        "Chat is no longer in the recent list.",
+                        ct);
+                    return;
+                }
+
+                await runtime.NavigateAsync(selected.Url, ct);
+                await telegram.AnswerCallbackQueryAsync(
+                    callback.Id,
+                    $"Switching to {TrimButtonText(selected.Title, 35)}",
+                    ct);
+                return;
+            }
+
+            await telegram.AnswerCallbackQueryAsync(
+                callback.Id,
+                "Unknown action.",
+                ct);
+        }
+        catch (Exception ex)
+        {
+            await telegram.AnswerCallbackQueryAsync(
+                callback.Id,
+                ex.Message.Length > 180 ? ex.Message[..180] : ex.Message,
+                ct);
+        }
+    }
+
+    private static TelegramInlineKeyboardMarkup BuildChatsKeyboard(
+        IReadOnlyList<RecentChat> chats)
+    {
+        var rows = chats
+            .Select(chat => (IReadOnlyList<TelegramInlineButton>)
+            [
+                new TelegramInlineButton
+                {
+                    Text = TrimButtonText(chat.Title, 42),
+                    CallbackData = $"chat:{ConversationId(chat.Url)}"
+                }
+            ])
+            .ToList();
+
+        rows.Add(
+        [
+            new TelegramInlineButton
+            {
+                Text = "➕ New chat",
+                CallbackData = "chat:new"
+            }
+        ]);
+
+        return new TelegramInlineKeyboardMarkup
+        {
+            InlineKeyboard = rows
+        };
+    }
+
+    private static string? ConversationId(string? url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed))
+            return null;
+
+        var parts = parsed.AbsolutePath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        return parts.Length >= 2 &&
+               string.Equals(parts[0], "c", StringComparison.OrdinalIgnoreCase)
+            ? parts[1]
+            : null;
+    }
+
+    private static string TrimButtonText(string value, int max)
+    {
+        var text = string.IsNullOrWhiteSpace(value) ? "ChatGPT" : value.Trim();
+        return text.Length <= max ? text : text[..(max - 1)] + "…";
     }
 
     private bool IsAllowed(long chatId, long userId) =>
