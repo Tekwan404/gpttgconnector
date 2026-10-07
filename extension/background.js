@@ -8,6 +8,7 @@ let boundUrl = null;
 let state = 'disconnected';
 let keepAliveTimer = null;
 const reloadingConversationTabs = new Set();
+const directNavigationTabs = new Set();
 
 function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
@@ -71,6 +72,18 @@ function connect() {
     }
 
     try {
+      if (command?.type === 'navigate') {
+        const target = command.url;
+
+        if (!target || !target.startsWith('https://chatgpt.com/')) {
+          throw new Error('Navigation target must be a chatgpt.com URL.');
+        }
+
+        directNavigationTabs.add(boundTabId);
+        await chrome.tabs.update(boundTabId, { url: target });
+        return;
+      }
+
       if (reloadingConversationTabs.has(boundTabId)) {
         await waitForTabReady(boundTabId);
         reloadingConversationTabs.delete(boundTabId);
@@ -289,6 +302,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.url) {
     if (!changeInfo.url.startsWith('https://chatgpt.com/')) {
       reloadingConversationTabs.delete(tabId);
+      directNavigationTabs.delete(tabId);
       await clearBinding();
       send({ type: 'unbind' });
       return;
@@ -312,6 +326,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     // another. Do not reload the transition from "new chat" to its first
     // generated /c/<id>, because that can happen while a response is running.
     if (
+      !directNavigationTabs.has(tabId) &&
       previousConversationId &&
       nextConversationId &&
       previousConversationId !== nextConversationId
@@ -327,6 +342,35 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
           error: `Could not refresh the newly selected ChatGPT conversation: ${error?.message || error}`
         });
       }
+    }
+
+    return;
+  }
+
+  if (
+    changeInfo.status === 'complete' &&
+    directNavigationTabs.has(tabId)
+  ) {
+    directNavigationTabs.delete(tabId);
+
+    try {
+      const ping = await ensureContentScript(tabId);
+      const refreshed = await chrome.tabs.get(tabId);
+
+      boundUrl = refreshed.url;
+      await chrome.storage.local.set({ boundTabId, boundUrl });
+
+      send({
+        type: 'bind',
+        url: boundUrl,
+        title: refreshed.title || tab?.title || 'ChatGPT',
+        detail: `direct_navigation content=${ping.version}`
+      });
+    } catch (error) {
+      send({
+        type: 'error',
+        error: `ChatGPT navigation failed: ${error?.message || error}`
+      });
     }
 
     return;
