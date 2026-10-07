@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.1.8';
+  const CONTENT_SCRIPT_VERSION = '0.1.9';
   if (window.__gptTgConnectorLoaded === CONTENT_SCRIPT_VERSION) return;
   window.__gptTgConnectorLoaded = CONTENT_SCRIPT_VERSION;
 
@@ -28,7 +28,7 @@
   const PRIMARY_BLOCK_SELECTOR =
     '.markdown, [data-message-content], .prose, [class*="markdown"], [class*="prose"]';
   const LEAF_BLOCK_SELECTOR =
-    'p, pre, blockquote, h1, h2, h3, h4, h5, h6, li';
+    'p, pre, blockquote, h1, h2, h3, h4, h5, h6, ul, ol, table';
 
   let activeJobId = null;
   let activePromptText = '';
@@ -307,7 +307,10 @@
   }
 
   function leafBlocks() {
-    return dedupeContainers([...root().querySelectorAll(LEAF_BLOCK_SELECTOR)]);
+    const nodes = [...root().querySelectorAll(LEAF_BLOCK_SELECTOR)]
+      .filter(node => !node.parentElement?.closest('ul, ol, table, pre, blockquote'));
+
+    return dedupeContainers(nodes);
   }
 
   function snapshotBlocks() {
@@ -325,10 +328,28 @@
     return text.includes(prompt) && text.length <= prompt.length + 120;
   }
 
+  function isConversationChrome(text) {
+    const value = normalizeText(text)
+      .toLowerCase()
+      .replace(/[:：]+$/, '')
+      .trim();
+
+    return [
+      'вы сказали',
+      'пользователь сказал',
+      'you said',
+      'user said',
+      'chatgpt сказал',
+      'chatgpt said',
+      'assistant said',
+      'ассистент сказал'
+    ].includes(value);
+  }
+
   function changedNodes(nodes, baselineMap) {
     return nodes
       .map(node => ({ node, text: readText(node) }))
-      .filter(item => item.text && !isPromptEcho(item.text))
+      .filter(item => item.text && !isPromptEcho(item.text) && !isConversationChrome(item.text))
       .filter(item => {
         const before = baselineMap?.get(item.node);
         return before === undefined || before !== item.text;
@@ -389,7 +410,7 @@
     const roles = roleDiagnostics();
     return [
       `primary=${primaryBlocks().length}`,
-      `leaves=${leafBlocks().length}`,
+      `blocks=${leafBlocks().length}`,
       `roleNodes=${roles.roleNodes}`,
       `turnShells=${roles.turnShells}`,
       composerDiagnostics()
