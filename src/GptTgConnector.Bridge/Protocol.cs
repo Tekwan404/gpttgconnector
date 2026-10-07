@@ -23,6 +23,10 @@ public sealed record EdgeEnvelope(
     string? Error = null,
     string? EventId = null);
 
-public sealed record BridgeCommand(\n    string Type,\n    string? JobId = null,\n    string? Text = null,\n    string? Url = null);
+public sealed record BridgeCommand(
+    string Type,
+    string? JobId = null,
+    string? Text = null,
+    string? Url = null);
 
 public sealed record BridgeJob(string Id, long ChatId, string Text, DateTimeOffset CreatedAt);
