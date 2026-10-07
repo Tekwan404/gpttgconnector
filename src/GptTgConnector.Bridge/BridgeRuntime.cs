@@ -23,7 +23,7 @@ public sealed class BridgeRuntime(ILogger<BridgeRuntime> logger)
 
     public string? BoundUrl { get; private set; }
     public string? BoundTitle { get; private set; }
-    public string LastState { get; private set; } = "disconnected";
+    public string LastState { get; private set; } = "disconnected";\n    public string? LastDetail { get; private set; }
     public bool ExtensionConnected => _socket is { State: WebSocketState.Open };
     public int QueueLength => Math.Max(0, Volatile.Read(ref _queued));
     public ChannelReader<BridgeJob> Jobs => _jobs.Reader;
