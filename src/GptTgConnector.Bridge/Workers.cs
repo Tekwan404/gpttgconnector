@@ -478,21 +478,29 @@ public sealed class JobWorker(
             ? result.Text.Trim()
             : "ChatGPT finished, but no readable final text was found.";
 
+        var conversationUrl = result.Url ?? runtime.BoundUrl;
+        var keyboard = TelegramUi.OpenChatKeyboard(conversationUrl);
+        IReadOnlyList<long> sentIds;
+
         if (!string.IsNullOrWhiteSpace(result.Html))
         {
-            await telegram.SendFormattedMessageAsync(
+            sentIds = await telegram.SendFormattedMessageTrackedAsync(
                 chatId,
                 result.Html.Trim(),
                 fallbackText,
-                ct);
+                ct,
+                keyboard);
         }
         else
         {
-            await telegram.SendMessageAsync(
+            sentIds = await telegram.SendMessageTrackedAsync(
                 chatId,
                 fallbackText,
-                ct);
+                ct,
+                keyboard);
         }
+
+        runtime.RememberTelegramMessages(sentIds, conversationUrl);
 
         if (!string.IsNullOrWhiteSpace(result.Error))
         {
@@ -566,21 +574,29 @@ public static class WebSocketEndpoint
                         var html = unsolicited.Html?.Trim();
                         var error = unsolicited.Error?.Trim();
 
+                        var conversationUrl = unsolicited.Url ?? runtime.BoundUrl;
+                        var keyboard = TelegramUi.OpenChatKeyboard(conversationUrl);
+                        IReadOnlyList<long> sentIds = [];
+
                         if (!string.IsNullOrWhiteSpace(html))
                         {
-                            await telegram.SendFormattedMessageAsync(
+                            sentIds = await telegram.SendFormattedMessageTrackedAsync(
                                 options.AllowedChatId,
                                 html,
                                 text ?? "ChatGPT finished, but no readable final text was found.",
-                                context.RequestAborted);
+                                context.RequestAborted,
+                                keyboard);
                         }
                         else if (!string.IsNullOrWhiteSpace(text))
                         {
-                            await telegram.SendMessageAsync(
+                            sentIds = await telegram.SendMessageTrackedAsync(
                                 options.AllowedChatId,
                                 text,
-                                context.RequestAborted);
+                                context.RequestAborted,
+                                keyboard);
                         }
+
+                        runtime.RememberTelegramMessages(sentIds, conversationUrl);
 
                         if (!string.IsNullOrWhiteSpace(error))
                         {
@@ -604,5 +620,34 @@ public static class WebSocketEndpoint
         {
             runtime.Detach(socket);
         }
+    }
+}
+
+
+public static class TelegramUi
+{
+    public static TelegramInlineKeyboardMarkup? OpenChatKeyboard(string? url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsed) ||
+            !string.Equals(parsed.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(parsed.Host, "chatgpt.com", StringComparison.OrdinalIgnoreCase) ||
+            !parsed.AbsolutePath.StartsWith("/c/", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return new TelegramInlineKeyboardMarkup
+        {
+            InlineKeyboard =
+            [
+                [
+                    new TelegramInlineButton
+                    {
+                        Text = "↗ Open in ChatGPT",
+                        Url = parsed.ToString()
+                    }
+                ]
+            ]
+        };
     }
 }
