@@ -1,5 +1,5 @@
 const BRIDGE_URL = 'ws://127.0.0.1:8765/ws';
-const CONTENT_SCRIPT_VERSION = '0.1.6';
+const CONTENT_SCRIPT_VERSION = '0.1.8';
 
 let socket = null;
 let reconnectTimer = null;
@@ -147,39 +147,6 @@ async function waitForExpectedContent(tabId, timeoutMs = 10000) {
   );
 }
 
-async function reloadTabAndWait(tabId, timeoutMs = 15000) {
-  await new Promise((resolve, reject) => {
-    let settled = false;
-
-    const cleanup = () => {
-      chrome.tabs.onUpdated.removeListener(onUpdated);
-      clearTimeout(timer);
-    };
-
-    const finish = error => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      error ? reject(error) : resolve();
-    };
-
-    const onUpdated = (updatedTabId, changeInfo) => {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        finish();
-      }
-    };
-
-    chrome.tabs.onUpdated.addListener(onUpdated);
-
-    const timer = setTimeout(
-      () => finish(new Error('Timed out while refreshing the bound ChatGPT tab.')),
-      timeoutMs
-    );
-
-    chrome.tabs.reload(tabId).catch(finish);
-  });
-}
-
 async function ensureContentScript(tabId) {
   const current = await pingContent(tabId);
 
@@ -187,21 +154,21 @@ async function ensureContentScript(tabId) {
     return current;
   }
 
-  // An extension reload does not replace a content script that is already
-  // running in an open ChatGPT page. Refresh the page to guarantee a clean,
-  // current script instead of stacking duplicate observers/listeners.
-  await reloadTabAndWait(tabId);
-
+  // Never reload the ChatGPT page just to refresh the connector.
+  // After an unpacked-extension Reload, the previous content-script context
+  // is invalidated, so reinject the current file directly into the open tab.
   try {
-    return await waitForExpectedContent(tabId, 8000);
-  } catch {
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content.js']
     });
-
-    return await waitForExpectedContent(tabId, 5000);
+  } catch (error) {
+    throw new Error(
+      `Could not inject ChatGPT content script: ${error?.message || error}`
+    );
   }
+
+  return await waitForExpectedContent(tabId, 5000);
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

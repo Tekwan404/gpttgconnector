@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_SCRIPT_VERSION = '0.1.6';
+  const CONTENT_SCRIPT_VERSION = '0.1.8';
   if (window.__gptTgConnectorLoaded === CONTENT_SCRIPT_VERSION) return;
   window.__gptTgConnectorLoaded = CONTENT_SCRIPT_VERSION;
 
@@ -271,7 +271,8 @@
     const form = composer?.closest('form');
 
     return [
-      `composer=${composer ? composer.tagName.toLowerCase() : 'none'}`,\n      `composerClass=${composer ? String(composer.className || '').replace(/\\s+/g, '.').slice(0, 80) : 'none'}`,
+      `composer=${composer ? composer.tagName.toLowerCase() : 'none'}`,
+      `composerClass=${composer ? String(composer.className || '').replace(/\\s+/g, '.').slice(0, 80) : 'none'}`,
       `editable=${Boolean(composer?.isContentEditable)}`,
       `composerText=${composerText().length}`,
       `form=${Boolean(form)}`,
